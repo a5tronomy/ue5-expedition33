@@ -1,0 +1,147 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/GpuSkinCommon.ush"
+
+uint {DataInterfaceName}_NumVertices;
+uint {DataInterfaceName}_InputStreamStart;
+uint {DataInterfaceName}_NumBoneInfluences;
+uint {DataInterfaceName}_InputWeightStart;
+uint {DataInterfaceName}_InputWeightStride;
+uint {DataInterfaceName}_InputWeightIndexSize;
+Buffer<float4> {DataInterfaceName}_BoneMatrices;
+Buffer<uint> {DataInterfaceName}_InputWeightStream;
+Buffer<uint> {DataInterfaceName}_InputWeightLookupStream;
+
+uint ReadNumVertices_{DataInterfaceName}()
+{
+	return {DataInterfaceName}_NumVertices;
+}
+
+#if !GPUSKIN_UNLIMITED_BONE_INFLUENCE
+
+int4 GetBlendIndices_{DataInterfaceName}(uint StreamOffset, uint ExtraInfluenceIndex)
+{
+	return GetBlendIndices({DataInterfaceName}_InputWeightStream, StreamOffset, ExtraInfluenceIndex);
+}
+
+float4 GetBlendWeights_{DataInterfaceName}(uint StreamOffset, uint ExtraInfluenceIndex)
+{
+	return GetBlendWeights( { DataInterfaceName }_InputWeightStream, StreamOffset, ExtraInfluenceIndex, { DataInterfaceName }_NumBoneInfluences);
+}
+
+#endif // GPUSKIN_UNLIMITED_BONE_INFLUENCE
+
+float3x4 GetBoneMatrix_{DataInterfaceName}(uint BoneIndex)
+{
+	uint BufferIndex = BoneIndex * 3;
+	return float3x4({DataInterfaceName}_BoneMatrices[BufferIndex], {DataInterfaceName}_BoneMatrices[BufferIndex + 1], {DataInterfaceName}_BoneMatrices[BufferIndex + 2]);
+}
+
+uint ReadNumBones_{DataInterfaceName}(uint VertexIndex)
+{
+#if !ENABLE_DEFORMER_BONES
+	return 1;
+#elif GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	const uint BufferIndex 		= {DataInterfaceName}_InputStreamStart + VertexIndex;
+	uint BlendOffsetCount = {DataInterfaceName}_InputWeightLookupStream[BufferIndex];
+	return BlendOffsetCount & 0xff;
+#else // !GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	return {DataInterfaceName}_NumBoneInfluences;
+#endif
+}
+
+float3x4 ReadBoneMatrix_{DataInterfaceName}(uint VertexIndex, uint BoneIndex)
+{
+#if !ENABLE_DEFORMER_BONES
+
+	return float3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
+
+#elif GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	const uint BufferIndex 		= {DataInterfaceName}_InputStreamStart + VertexIndex;
+	uint BlendOffsetCount = {DataInterfaceName}_InputWeightLookupStream[BufferIndex];
+	int StreamOffset = BlendOffsetCount >> 8;
+	int BoneIndexSize = {DataInterfaceName}_InputWeightIndexSize & 0xff;
+	int BoneIndexOffset = StreamOffset + (BoneIndexSize * BoneIndex);
+	int BoneGlobalIndex = {DataInterfaceName}_InputWeightStream[BoneIndexOffset];
+	if (BoneIndexSize > 1)
+	{
+		BoneGlobalIndex = {DataInterfaceName}_InputWeightStream[BoneIndexOffset + 1] << 8 | BoneGlobalIndex;
+	}
+	
+	return GetBoneMatrix_{DataInterfaceName}(BoneGlobalIndex);
+
+#else // !GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	
+	uint StreamOffset = {DataInterfaceName}_InputWeightStart + (VertexIndex * ({DataInterfaceName}_InputWeightStride / 4));
+	int BlendIndex = GetBlendIndices_{DataInterfaceName}(StreamOffset, BoneIndex / 4)[BoneIndex & 0x3];
+	return GetBoneMatrix_{DataInterfaceName}(BlendIndex);
+
+#endif
+}
+
+float ReadBoneWeight_{DataInterfaceName}(uint VertexIndex, uint BoneIndex)
+{
+#if !ENABLE_DEFORMER_BONES
+
+	return 1;
+
+#elif GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	const uint BufferIndex 		= {DataInterfaceName}_InputStreamStart + VertexIndex;	
+	uint BlendOffsetCount = {DataInterfaceName}_InputWeightLookupStream[BufferIndex];
+	int NumBoneInfluencesLocal = BlendOffsetCount & 0xff;
+	int StreamOffset = BlendOffsetCount >> 8;
+	int BoneIndexSize = {DataInterfaceName}_InputWeightIndexSize & 0xff;
+	int BoneWeightSize = {DataInterfaceName}_InputWeightIndexSize >> 8;
+	int WeightsOffset = StreamOffset + (BoneIndexSize * NumBoneInfluencesLocal);
+	int BoneWeightOffset = WeightsOffset + BoneIndex * BoneWeightSize;
+	
+	if (BoneWeightSize > 1)
+	{
+		return float({DataInterfaceName}_InputWeightStream[BoneWeightOffset + 1] << 8 | {DataInterfaceName}_InputWeightStream[BoneWeightOffset]) / 65535.0;
+	}
+	else
+	{
+		return float({DataInterfaceName}_InputWeightStream[BoneWeightOffset]) / 255.0f;
+	}
+
+#else // !GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	
+	uint StreamOffset = {DataInterfaceName}_InputWeightStart + (VertexIndex * ({DataInterfaceName}_InputWeightStride / 4));
+	float BlendWeight = GetBlendWeights_{DataInterfaceName}(StreamOffset, BoneIndex / 4)[BoneIndex & 0x3];
+	return BlendWeight;
+
+#endif
+}
+
+float3x4 ReadWeightedBoneMatrix_{DataInterfaceName}(uint VertexIndex)
+{
+#if !ENABLE_DEFORMER_BONES
+
+	return float3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
+
+#elif GPUSKIN_UNLIMITED_BONE_INFLUENCE
+
+	const uint BufferIndex 		= {DataInterfaceName}_InputStreamStart + VertexIndex;
+	const uint BlendOffsetCount = {DataInterfaceName}_InputWeightLookupStream[BufferIndex];
+	return ComputeBoneMatrixWithUnlimitedInfluences({DataInterfaceName}_BoneMatrices, {DataInterfaceName}_InputWeightStream, {DataInterfaceName}_InputWeightIndexSize, BlendOffsetCount);
+
+#else
+
+	const uint StreamOffset = {DataInterfaceName}_InputWeightStart + (VertexIndex * ({DataInterfaceName}_InputWeightStride / 4));
+	const uint NumInfluences = {DataInterfaceName}_NumBoneInfluences;
+
+	FGPUSkinIndexAndWeight IndicesAndWeights = (FGPUSkinIndexAndWeight)0;
+	if (NumInfluences > 0)
+	{
+		IndicesAndWeights.BlendIndices  = GetBlendIndices_{DataInterfaceName}(StreamOffset, 0);
+		IndicesAndWeights.BlendWeights  = GetBlendWeights_{DataInterfaceName}(StreamOffset, 0);
+	}
+	if (NumInfluences > 4)
+	{
+		IndicesAndWeights.BlendIndices2 = GetBlendIndices_{DataInterfaceName}(StreamOffset, 1);
+		IndicesAndWeights.BlendWeights2 = GetBlendWeights_{DataInterfaceName}(StreamOffset, 1);
+	}
+	return ComputeBoneMatrixWithLimitedInfluences({DataInterfaceName}_BoneMatrices, IndicesAndWeights, NumInfluences > 4);
+
+#endif
+}

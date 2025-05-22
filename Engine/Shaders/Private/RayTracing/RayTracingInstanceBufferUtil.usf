@@ -1,0 +1,176 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	RayTracingInstanceCopy.usf: Build ray tracing instances in the GPU 
+===============================================================================================*/
+
+#include "RayTracingCommon.ush"
+#include "../SceneData.ush"
+#include "../Common.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 1
+#endif
+
+struct FRayTracingInstanceDescriptorInput
+{
+	uint GPUSceneInstanceOrTransformIndex;
+	uint OutputDescriptorIndex;
+	uint AccelerationStructureIndex;
+	uint InstanceId;
+	uint InstanceMaskAndFlags;
+	uint InstanceContributionToHitGroupIndex;
+	uint bApplyLocalBoundsTransform;
+};
+
+uint NumInstances;
+uint InputDescOffset;
+
+uint InstanceSceneDataSOAStride;
+
+float3 FarFieldReferencePos;
+
+float3 PreViewTranslationHigh;
+float3 PreViewTranslationLow;
+
+RWStructuredBuffer<FRayTracingInstanceDescriptor> InstancesDescriptors;
+
+StructuredBuffer<FRayTracingInstanceDescriptorInput> InputInstanceDescriptors;
+ByteAddressBuffer AccelerationStructureAddresses;
+// Transforms are float3x4 row-major matrices stored as 3 float4
+// because of FXC matrix packing issues when using StructuredBuffer<float3x4>
+StructuredBuffer<float4> InstanceTransforms;
+
+// Extra per instance debug data
+RWStructuredBuffer<uint> RWDebugInstanceGPUSceneIndices;
+
+#if GPU_CULLING
+
+float CullingRadius;
+float FarFieldCullingRadius;
+float AngleThresholdRatioSq;
+float3 ViewOrigin;
+uint CullingMode;
+
+bool CullInstance(FInstanceSceneData InstanceSceneData, float4x4 LocalToTranslatedWorld4x4, bool bFarFieldInstance)
+{
+	bool bIsVisible = true;
+
+	const float3 LocalBoxCenter = InstanceSceneData.LocalBoundsCenter.xyz;
+	const float3 LocalBoxExtent = InstanceSceneData.LocalBoundsExtent.xyz;
+	const float4x4 LocalToTranslatedWorld = LocalToTranslatedWorld4x4;
+	const float3 NonUniformScale = InstanceSceneData.NonUniformScale.xyz;
+	
+	const float3 CenterTranslatedWorld = mul(float4(LocalBoxCenter, 1.0f), LocalToTranslatedWorld).xyz;
+	const float Radius = length(LocalBoxExtent * NonUniformScale);
+
+	const float InstanceDrawDistSq = length2(CenterTranslatedWorld - ViewOrigin);
+	
+	if (bFarFieldInstance)
+	{
+		bIsVisible = InstanceDrawDistSq <= Square(FarFieldCullingRadius + Radius);
+	}
+	else
+	{
+		const bool bIsVisibleDistance = InstanceDrawDistSq <= Square(CullingRadius + Radius);
+		const bool bIsVisibleAngle = (Square(Radius) / InstanceDrawDistSq) >= AngleThresholdRatioSq;
+		
+		// Only culling modes 2 & 3 are supported for now
+		if (CullingMode == 3)
+		{
+			bIsVisible = bIsVisibleDistance && bIsVisibleAngle;
+		}
+		else
+		{
+			bIsVisible = bIsVisibleDistance || bIsVisibleAngle;	
+		}
+		
+	}	
+
+	return !bIsVisible;
+}
+
+#endif // GPU_CULLING
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void RayTracingBuildInstanceBufferCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const FDFVector3 PreViewTranslation = MakeDFVector3(PreViewTranslationHigh, PreViewTranslationLow);
+
+	const uint Index = DispatchThreadId.x;
+
+	bool bCulled = false;
+
+	if (Index < NumInstances)
+	{
+		FRayTracingInstanceDescriptorInput InputDesc = InputInstanceDescriptors[InputDescOffset + Index];
+
+#if USE_GPUSCENE
+		FInstanceSceneData InstanceSceneData = GetInstanceSceneData(InputDesc.GPUSceneInstanceOrTransformIndex, InstanceSceneDataSOAStride);
+		FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceSceneData.PrimitiveId);
+
+		float4x4 LocalToTranslatedWorld4x4 = DFFastToTranslatedWorld(InstanceSceneData.LocalToWorld, PreViewTranslation);
+
+		const bool bFarFieldInstance = PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_RAYTRACING_FAR_FIELD;
+
+#if GPU_CULLING
+		const bool bHasGroupId = PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_RAYTRACING_HAS_GROUPID;
+		if (!bHasGroupId)
+		{
+			bCulled = CullInstance(InstanceSceneData, LocalToTranslatedWorld4x4, bFarFieldInstance);
+		}
+#endif // GPU_CULLING
+
+		if (bFarFieldInstance)
+		{
+			LocalToTranslatedWorld4x4[3].xyz += FarFieldReferencePos;
+		}
+
+		if (InputDesc.bApplyLocalBoundsTransform)
+		{
+			float4x4 ProcT;
+			ProcT[0] = float4(InstanceSceneData.LocalBoundsExtent.x * 2, 0, 0, 0);
+			ProcT[1] = float4(0, InstanceSceneData.LocalBoundsExtent.y * 2, 0, 0);
+			ProcT[2] = float4(0, 0, InstanceSceneData.LocalBoundsExtent.z * 2, 0);
+			ProcT[3] = float4(InstanceSceneData.LocalBoundsCenter, 1);
+
+			LocalToTranslatedWorld4x4 = mul(ProcT, LocalToTranslatedWorld4x4);
+		}
+
+		LocalToTranslatedWorld4x4 = transpose(LocalToTranslatedWorld4x4);
+
+		float3x4 LocalToTranslatedWorld;
+		LocalToTranslatedWorld[0] = LocalToTranslatedWorld4x4[0];
+		LocalToTranslatedWorld[1] = LocalToTranslatedWorld4x4[1];
+		LocalToTranslatedWorld[2] = LocalToTranslatedWorld4x4[2];
+
+#if OUTPUT_INSTANCE_GPUSCENE_INDEX
+		if (InputDesc.AccelerationStructureIndex != 0xFFFFFFFF && !bCulled)
+		{
+			RWDebugInstanceGPUSceneIndices[InputDesc.OutputDescriptorIndex] = InputDesc.GPUSceneInstanceOrTransformIndex;
+		}
+#endif // OUTPUT_INSTANCE_GPUSCENE_INDEX
+
+#else
+		float3x4 LocalToTranslatedWorld;
+		LocalToTranslatedWorld[0] = InstanceTransforms[InputDesc.GPUSceneInstanceOrTransformIndex * 3 + 0];
+		LocalToTranslatedWorld[1] = InstanceTransforms[InputDesc.GPUSceneInstanceOrTransformIndex * 3 + 1];
+		LocalToTranslatedWorld[2] = InstanceTransforms[InputDesc.GPUSceneInstanceOrTransformIndex * 3 + 2];
+#endif // USE_GPUSCENE
+
+		uint2 BlasAddress = 0;
+
+		if (InputDesc.AccelerationStructureIndex != 0xFFFFFFFF && !bCulled)
+		{
+			BlasAddress = AccelerationStructureAddresses.Load2(InputDesc.AccelerationStructureIndex * 8);
+		}
+
+		InstancesDescriptors[InputDesc.OutputDescriptorIndex] = BuildPlatformRayTracingInstanceDesc(
+			InputDesc.InstanceMaskAndFlags & 0xFF,
+			InputDesc.InstanceId,
+			TranslateRayTracingInstanceFlags((InputDesc.InstanceMaskAndFlags >> 8) & 0xFF),
+			InputDesc.InstanceContributionToHitGroupIndex,
+			LocalToTranslatedWorld,
+			BlasAddress);
+	}
+}

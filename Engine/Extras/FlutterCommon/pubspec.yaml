@@ -1,0 +1,49 @@
+name: epic_common
+description: Utility package with shared code for use across Epic's Flutter projects.
+version: 0.0.1
+
+environment:
+  sdk: ">=3.0.6 <4.0.0"
+  flutter: "^3.16.3"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  flutter_localizations:
+    sdk: flutter
+
+  arb_generator: ^0.0.3
+  flutter_svg: ^2.0.9
+  intl: any
+  logging: ^1.2.0
+  path_provider: ^2.0.11
+  package_info_plus: ^5.0.1
+  provider: ^6.0.2
+  streaming_shared_preferences: ^2.0.0
+  uuid: ^4.2.1
+  archive: ^3.2.0
+  share_plus: ^7.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.1
+
+flutter:
+  generate: true
+  assets:
+    - assets/icons/
+    - assets/images/
+
+  shaders:
+    - assets/shaders/scroll_view_fade.frag
+
+# Automatically generate arb localization files from a CSV
+arb_generator:
+  input_filepath: "lib/src/l10n/l10n.csv"
+  output_directory: "lib/src/l10n"
+  filename_prepend: "epic_common_"
+  csv_settings:
+    description_index: 1
+    base_index: 2

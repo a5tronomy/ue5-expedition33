@@ -1,0 +1,184 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+PathTracing.usf: Reference path tracing
+===============================================================================================*/
+
+#define PATH_TRACING  1
+
+#define PATH_TRACING_SHADER_VERSION 0x51478b68 // Bump to force-compile this shader
+
+// Ensure specular profile and glints are supported
+#if SUBSTRATE_ENABLED && PATH_TRACER_USE_SUBSTRATE_SPECIAL_COMPLEX_MATERIAL
+#define SUBSTRATE_COMPLEXSPECIALPATH 1
+#endif
+
+#include "PathTracingCore.ush"
+
+// describe how we split up the image between tiles and amongst GPUs
+int2 TilePixelOffset;
+int2 TileTextureOffset;
+int ScanlineStride;
+int ScanlineWidth;
+
+
+// Which pixel on screen are we computing?
+// We want to spread out the scanlines evenly across the screen so that each GPU works on a similarly sized task
+int2 ComputePixelIndex(uint2 DispatchIdx)
+{
+	return DispatchIdx * int2(1, ScanlineStride) + TilePixelOffset;
+}
+
+// Where should we store the accumulated pixels of this dispatch?
+// We want all the scanlines computed by a given GPU to be contiguous in memory so we can copy them easily
+int2 ComputeTextureIndex(uint2 DispatchIdx)
+{
+	return DispatchIdx + TileTextureOffset;
+}
+
+#if PATH_TRACER_USE_COMPACTION == 1
+
+int Bounce;
+RWStructuredBuffer<FPathTracingPackedPathState> PathStateData;
+Buffer<int> ActivePaths;
+RWBuffer<int> NextActivePaths;
+RWBuffer<uint> NumPathStates;
+
+
+FPathState LoadPathStateData(uint Index)
+{
+	FPathTracingPackedPathState Data = PathStateData[Index];
+	FPathState Output = (FPathState)0;
+	Output.RandSequence.SampleIndex = Data.RandSeqSampleIndex;
+	Output.RandSequence.SampleSeed  = Data.RandSeqSampleSeed;
+	Output.Radiance = Data.Radiance;
+	Output.Alpha = Data.Alpha;
+	Output.PackedAlbedoNormal = Data.PackedAlbedoNormal;
+	Output.Ray.Origin = Data.RayOrigin;
+	Output.Ray.Direction = Data.RayDirection;
+	Output.Ray.TMin = 0;
+	Output.Ray.TMax = POSITIVE_INFINITY;
+	Output.PathThroughput = Data.PathThroughput;
+	Output.PackedRoughnessSigma = Data.PackedRoughnessSigma;
+	return Output;
+}
+
+void StorePathStateData(FPathState PathState, uint Index)
+{
+	FPathTracingPackedPathState Data;
+	Data.RandSeqSampleIndex = PathState.RandSequence.SampleIndex;
+	Data.RandSeqSampleSeed  = PathState.RandSequence.SampleSeed;
+	Data.Radiance = PathState.Radiance;
+	Data.Alpha = PathState.Alpha;
+	Data.PackedAlbedoNormal = PathState.PackedAlbedoNormal;
+	Data.RayOrigin = PathState.Ray.Origin;
+	Data.RayDirection = PathState.Ray.Direction;
+	Data.PathThroughput = PathState.PathThroughput;
+	Data.PackedRoughnessSigma = PathState.PackedRoughnessSigma;
+	PathStateData[Index] = Data;
+}
+
+RAY_TRACING_ENTRY_RAYGEN(PathTracingMainRG)
+{
+	uint2 DispatchIdx = DispatchRaysIndex().xy;
+	const uint2 DispatchDim = DispatchRaysDimensions().xy;
+
+	int LinearPixelIndex = DispatchIdx.x + DispatchDim.x * DispatchIdx.y;
+	if (LinearPixelIndex == 0)
+	{
+		// write other dimensions for indirect dispatch
+		NumPathStates[1] = 1;
+		NumPathStates[2] = 1;
+	}
+	FPathState PathState;
+	if (Bounce == 0)
+	{
+#if PATH_TRACER_USE_ADAPTIVE_SAMPLING
+		if (Iteration > 0)
+		{
+			LinearPixelIndex = ActivePaths[LinearPixelIndex];
+			if (LinearPixelIndex < 0)
+			{
+				return;
+			}
+			DispatchIdx = uint2(LinearPixelIndex % DispatchDim.x, LinearPixelIndex / DispatchDim.x);
+		}
+#endif
+		PathState = CreatePathState(ComputePixelIndex(DispatchIdx), 
+									ComputeTextureIndex(DispatchIdx));
+	}
+	else
+	{
+		LinearPixelIndex = ActivePaths[LinearPixelIndex];
+		if (LinearPixelIndex < 0)
+		{
+			return; // nothing left to do on this thread
+		}
+		PathState = LoadPathStateData(LinearPixelIndex);
+	}
+
+	const bool KeepGoing = PathTracingKernel(PathState, Bounce);
+	const uint2 TextureIndex = ComputeTextureIndex(uint2(LinearPixelIndex % DispatchDim.x,
+	                                                     LinearPixelIndex / DispatchDim.x));
+	if (Bounce == 0)
+	{
+		// Camera ray must write depth right away because we don't want to have to carry DepthZ in the PackedPathState
+		PathState.WriteDepth(TextureIndex);
+	}
+	if (KeepGoing)
+	{
+		// NOTE: using wave instructions to reduce contention seems to run slightly slower? (tested on RTX-3080)
+		uint PathStateIndex;
+		InterlockedAdd(NumPathStates[0], 1, PathStateIndex);
+		NextActivePaths[PathStateIndex] = LinearPixelIndex;
+		StorePathStateData(PathState, LinearPixelIndex);
+	}
+	else
+	{
+		// nothing left to do
+		// Accumulate radiance and update pixel variance
+		PathState.WritePixel(TextureIndex);
+	}
+}
+
+#else // PATH_TRACER_USE_COMPACTION == 0
+
+#if PATH_TRACER_USE_ADAPTIVE_SAMPLING
+Buffer<int> ActivePaths;
+#endif
+
+RAY_TRACING_ENTRY_RAYGEN(PathTracingMainRG)
+{
+	uint2 DispatchIdx = DispatchRaysIndex().xy;
+	const uint2 DispatchDim = DispatchRaysDimensions().xy;
+
+#if PATH_TRACER_USE_ADAPTIVE_SAMPLING
+	if (Iteration > 0)
+	{
+		uint LinearPixelIndex = DispatchIdx.x + DispatchDim.x * DispatchIdx.y;
+		LinearPixelIndex = ActivePaths[LinearPixelIndex];
+		if (LinearPixelIndex < 0)
+		{
+			return;
+		}
+		DispatchIdx = uint2(LinearPixelIndex % DispatchDim.x, LinearPixelIndex / DispatchDim.x);
+	}
+#endif
+	FPathState PathState = CreatePathState(ComputePixelIndex(DispatchIdx), ComputeTextureIndex(DispatchIdx));
+
+	for (int Bounce = 0; Bounce <= MaxBounces; Bounce++)
+	{
+		if (!PathTracingKernel(PathState, Bounce))
+		{
+			// kernel had nothing more to do
+			break;
+		}
+	}
+
+	// Accumulate radiance and update pixel variance
+	int2 TextureIndex = ComputeTextureIndex(DispatchIdx);
+	PathState.WritePixel(TextureIndex);
+	PathState.WriteDepth(TextureIndex);
+}
+
+#endif

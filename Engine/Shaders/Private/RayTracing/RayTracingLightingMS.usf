@@ -1,0 +1,131 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Shared/RayTracingTypes.h"
+#include "../Common.ush"
+
+#define SUPPORT_CONTACT_SHADOWS		0
+#define USE_SOURCE_TEXTURE			1
+#define USE_SOURCE_TEXTURE_ARRAY	1
+
+#define PreIntegratedGF				ReflectionStruct.PreIntegratedGF			
+#define PreIntegratedGFSampler		ReflectionStruct.PreIntegratedGFSampler	
+
+// Ensure that SSS material don't override their albedo to compute only the incident irradiance
+#define SUBSTRATE_SSS_MATERIAL_OVERRIDE 0
+#define MATERIAL_FULLY_ROUGH 0
+#define SUBSTRATE_COMPLEXSPECIALPATH 1
+#define SUBSTRATE_GLINTS_ALLOWED 0
+
+#ifndef SUPPORT_LIGHT_FUNCTION
+#define SUPPORT_LIGHT_FUNCTION 0
+#endif
+
+#include "../SceneTextureParameters.ush"
+#include "RayTracingCommon.ush"
+
+//////////////////////////////////////////////////////////////////////////////////////////
+// Include continuous
+
+#if SUBSTRATE_ENABLED
+#include "../Substrate/Substrate.ush"
+#include "../Substrate/SubstrateEvaluation.ush"
+#endif
+
+#include "RayTracingDeferredShadingCommon.ush"
+#include "RayTracingLightingCommon.ush" 
+#if SUBSTRATE_ENABLED
+#include "../Substrate/SubstrateDeferredLighting.ush"
+#endif
+
+#if SUPPORT_LIGHT_FUNCTION
+#include "/Engine/Generated/Material.ush"
+
+// TODO: if we could just bind loose parameters, we could avoid this workaround for getting the shader parameters needed by the routines in LightFunctionCommon.ush
+#define LightFunctionParameters  RaytracingLightFunctionParameters.LightFunctionParameters
+#define LightFunctionParameters2 RaytracingLightFunctionParameters.LightFunctionParameters2
+#define LightFunctionTranslatedWorldToLight RaytracingLightFunctionParameters.LightFunctionTranslatedWorldToLight
+
+#include "../LightFunctionCommon.ush"
+#include "RayTracingLightFunctionCommon.ush"
+#endif
+
+RAY_TRACING_ENTRY_MISS(RayTracingLightingMS, FPackedMaterialClosestHitPayload, PackedPayload)
+{
+	FRayDesc DummyRay = (FRayDesc)0;
+
+	FMaterialClosestHitPayload Payload = UnpackRayTracingPayload(PackedPayload, DummyRay);
+
+	// Light index is packed into HitT as this component is only accessed by closest hit or miss shaders.
+	// Since closest hit execution is disabled using a ray flag, it is safe to pack custom data here.
+	uint LightIndex = asuint(Payload.HitT);
+	float3 CameraVector = Payload.GetRayDirection();// IndirectIrradiance field is used to pass through the camera vector
+	float3 V = -CameraVector;
+	Payload.IndirectIrradiance = (float3)0;
+
+	uint LightType = 0;
+	FDeferredLightData LightData = GetRayTracingDeferredLightData(LightIndex, LightType);
+
+	float4 LightAttenuation = 1.0f;
+
+	float3 WorldPosition = TranslatedWorldRayOrigin(); // Shadow ray is traced from the shaded point
+
+	float LightProfileMultiplier = ComputeLightProfileMultiplier(WorldPosition, LightData.TranslatedWorldPosition, -LightData.Direction, LightData.Tangent, LightData.IESAtlasIndex);
+
+	const float Dither = 0.5f;
+	const uint2 SVPos = uint2(0, 0);
+
+	// LWC_TODO - lighting wants translated world space
+#if SUBSTRATE_ENABLED
+	float3 L = LightData.Direction;	// Already normalized
+	float3 ToLight = L;
+	
+	float LightMask = 1;
+	if (LightData.bRadialLight)
+	{
+		LightMask = GetLocalLightAttenuation(WorldPosition, LightData, ToLight, L);
+	}
+
+	float3 LightContribution = 0;
+	if (LightMask > 0)
+	{
+		FSubstrateAddressing SubstrateAddressing = GetSubstratePixelDataByteOffset(0,0,0);
+		FSubstratePixelHeader SubstratePixelHeader = UnpackSubstrateHeaderIn(PackedPayload.SubstrateData, SubstrateAddressing, PackedPayload.SubstrateData);
+
+		FSubstrateShadowTermInputParameters SubstrateShadowTermInputParameters	= GetInitialisedSubstrateShadowTermInputParameters();
+		SubstrateShadowTermInputParameters.bEvaluateShadowTerm					= true;
+		SubstrateShadowTermInputParameters.SceneDepth							= 1.0f; // Do not use depth
+		SubstrateShadowTermInputParameters.PrecomputedShadowFactors				= 1.0f; // Do not use precomputed factors
+		SubstrateShadowTermInputParameters.TranslatedWorldPosition				= WorldPosition;
+		SubstrateShadowTermInputParameters.LightAttenuation						= LightAttenuation;
+		SubstrateShadowTermInputParameters.Dither								= Dither;
+
+		// RayTracing + Lighting + Substrate is too expenssive (as in uses too many registers) to be supported on some platofrms
+		FSubstrateDeferredLighting Lighting = SubstrateDeferredLighting(
+			LightData,
+			V,
+			L,
+			ToLight,
+			LightMask,
+			SubstrateShadowTermInputParameters,
+			PackedPayload.SubstrateData,
+			SubstrateAddressing,
+			SubstratePixelHeader);
+		LightContribution = Lighting.SceneColor.xyz;
+	}
+#else
+	// LWC_TODO - lighting wants translated world space
+	float SurfaceShadow = 1.0f;
+	FGBufferData GBufferData = GetGBufferDataFromPayload(Payload);
+	float3 LightContribution = GetDynamicLighting(WorldPosition, CameraVector, GBufferData, 1.0f, GBufferData.ShadingModelID, LightData, LightAttenuation, Dither, SVPos, SurfaceShadow).xyz;
+#endif // SUBSTRATE_ENABLED
+
+#if SUPPORT_LIGHT_FUNCTION
+	float3 LightFunctionMult = GetRayTracingLightFunction(WorldPosition);
+	LightProfileMultiplier *= dot(LightFunctionMult, .3333f); // convert to greyscale (for compatibility with the appearance in the primary view)
+#endif
+
+	float3 AccumulatedRadiance = Payload.Radiance + LightContribution * LightProfileMultiplier;
+
+	PackedPayload.SetRadiance(AccumulatedRadiance);
+}
+

@@ -1,0 +1,21 @@
+name: TentacleLibrary
+description: FFI bindings for the Tentacle SDK.
+language: c
+preamble: |-
+  // Copyright Epic Games, Inc. All Rights Reserved.
+  //
+  // This is an auto-generated file. Do not edit.
+  // See FlutterLiveLinkVCAM/README for information on how to regenerate this.
+  //
+output: 'lib/tentacle/api/tentacle_ffi.g.dart'
+compiler-opts:
+  - '-I../../../Restricted/NotForLicensees/Source/ThirdParty/TentacleSDK/include/'
+headers:
+  entry-points:
+    - '../../../Restricted/NotForLicensees/Source/ThirdParty/TentacleSDK/include/Tentacle/TentacleDeviceCache.h'
+exclude-all-by-default: true
+functions:
+  include:
+    - 'TentacleDeviceCacheGetDevice'
+    - 'TentacleAdvertisementGetFrameRate'
+    - 'TentacleTimecodeSecondsAtTimestamp'

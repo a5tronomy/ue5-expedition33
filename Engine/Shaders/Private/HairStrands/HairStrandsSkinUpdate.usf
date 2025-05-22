@@ -1,0 +1,85 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "/Engine/Public/Platform.ush"
+#include "../GpuSkinCommon.ush"
+
+#if SHADER_SKIN_UPDATE
+//----------------------------------------------------------------------------------
+
+uint WeightIndexSize; // bone index size: 1 - 8bit or 2 - 16bit
+uint SectionVertexBaseIndex;
+uint NumTotalVertices;
+uint NumVertexToProcess;
+uint WeightStride;
+
+Buffer<uint> WeightLookup;
+Buffer<uint> VertexWeights;
+Buffer<float> RestPositions;
+
+// Current Position
+Buffer<float4> BoneMatrices;
+RWBuffer<float> DeformedPositions;
+
+// Previous Position
+#if PERMUTATION_PREV
+Buffer<float4> PrevBoneMatrices;
+RWBuffer<float> PrevDeformedPositions;
+#endif
+
+//----------------------------------------------------------------------------------
+
+[numthreads(GROUP_SIZE,1,1)]
+void UpdateSkinPositionCS(uint3 GroupID : SV_GroupID,
+ uint3 DispatchThreadID : SV_DispatchThreadID,
+ uint3 GroupThreadID : SV_GroupThreadID)
+{
+	const uint VertexIndex = DispatchThreadID.x + SectionVertexBaseIndex;
+	if (DispatchThreadID.x < NumVertexToProcess && VertexIndex < NumTotalVertices)
+	{
+		const uint PositionOffset = VertexIndex * 3;
+		const uint WeightOffset = VertexIndex * WeightStride / 4;
+
+		#if !GPUSKIN_UNLIMITED_BONE_INFLUENCE
+		const FGPUSkinIndexAndWeight IndicesAndWeights = GetBlendIndicesAndWeights(VertexWeights, WeightOffset);
+		#endif
+
+		const float4 InputPosition = float4(
+			RestPositions[PositionOffset],
+			RestPositions[PositionOffset+1],
+			RestPositions[PositionOffset+2],
+			1.0);
+
+		// Current position
+		{
+			#if GPUSKIN_UNLIMITED_BONE_INFLUENCE
+			const FBoneMatrix BlendedMatrix = ComputeBoneMatrixWithUnlimitedInfluences(BoneMatrices, VertexWeights, WeightIndexSize, WeightLookup[VertexIndex]);
+			#else
+			const FBoneMatrix BlendedMatrix = ComputeBoneMatrixWithLimitedInfluences(BoneMatrices, IndicesAndWeights);
+			#endif
+
+			const float3 OutputPosition =  mul(BlendedMatrix, InputPosition);
+			DeformedPositions[PositionOffset  ] = OutputPosition.x;
+			DeformedPositions[PositionOffset+1] = OutputPosition.y;
+			DeformedPositions[PositionOffset+2] = OutputPosition.z;
+		}
+
+		// Previous position
+	#if PERMUTATION_PREV
+		{
+			#if GPUSKIN_UNLIMITED_BONE_INFLUENCE
+			const FBoneMatrix PrevBlendedMatrix = ComputeBoneMatrixWithUnlimitedInfluences(PrevBoneMatrices, VertexWeights, WeightIndexSize, WeightLookup[VertexIndex]);
+			#else
+			const FBoneMatrix PrevBlendedMatrix = ComputeBoneMatrixWithLimitedInfluences(PrevBoneMatrices, IndicesAndWeights);
+			#endif
+
+			const float3 OutputPosition = mul(PrevBlendedMatrix, InputPosition);
+			PrevDeformedPositions[PositionOffset  ] = OutputPosition.x;
+			PrevDeformedPositions[PositionOffset+1] = OutputPosition.y;
+			PrevDeformedPositions[PositionOffset+2] = OutputPosition.z;
+		}
+	#endif
+	}
+}
+#endif // SHADER_SKIN_UPDATE

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--GameSDK plugin additions-->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+	<!-- init section is always evaluated once per architecture -->
+	<init>
+		<log text="GoogleGameSDK Android init"/>
+		<setBoolFromProperty result="bIncludeMemAdvisor" ini="Engine" section="/Script/AndroidRuntimeSettings.AndroidRuntimeSettings" property="bEnableGameSDKMemAdvisor" default="false"/>
+	</init>
+
+	<!-- optional additions to the GameActivity class in GameActivity.java -->
+	<gameActivityClassAdditions>
+		<if condition="bIncludeMemAdvisor">
+			<true>
+				<insert>
+					public native long nativeGetMemAdvisorAvailableBytes();
+				</insert>
+			</true>
+		</if>
+	</gameActivityClassAdditions>
+	<gameActivityMemStatAdditions>
+		<if condition="bIncludeMemAdvisor">
+			<true>
+				<insert>
+					memLog += ("memstat: [MemAdvisor] Available: "+nativeGetMemAdvisorAvailableBytes()/1024+" kB" );
+				</insert>
+			</true>
+		</if>
+	</gameActivityMemStatAdditions>
+	
+	<resourceCopies>
+		<if condition="bIncludeMemAdvisor">
+			<true>
+				<log text="Copy Memory Advice resources"/>
+				<copyDir src="$S(PluginDir)/gamesdk/assets"
+						dst="$S(BuildDir)/assets" />
+			</true>
+		</if>
+	</resourceCopies>
+</root>

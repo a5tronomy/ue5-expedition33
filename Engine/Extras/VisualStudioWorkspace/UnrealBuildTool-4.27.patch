@@ -1,0 +1,874 @@
+From 4fc57fd994de108383f838bcbb9af9cef980cbb1 Mon Sep 17 00:00:00 2001
+From: Henrique Fernandes Baggio <hebaggio@microsoft.com>
+Date: Wed, 17 Jan 2024 19:49:54 -0800
+Subject: [PATCH] [UE4.27] Project Generator for VS Workspace support
+
+Adding a new Project Generator for Visual Studio that will be used for
+the new support to opening `.uproject` files directly in the IDE without
+generating the traditional `.sln` and .vcxproj files.
+
+This is based on the QueryMode API in `ue5-main` and adapted to the
+GenerateProjectFiles flow. The project files will contain information for each
+Target+Configuration+Platform combinations that are used the project.
+
+Visual Studio will automatically invoke this new generator during the flow to
+open a `.uproject` file directly.
+---
+ .../Configuration/UEBuildTarget.cs            |   2 +-
+ .../Modes/GenerateProjectFilesMode.cs         |   4 +
+ .../Platform/Windows/VCToolChain.cs           |  26 ++
+ .../ProjectFiles/ProjectFileGenerator.cs      |   5 +-
+ .../VSWorkspaceProjectFile.cs                 | 392 ++++++++++++++++++
+ .../VSWorkspaceProjectFileGenerator.cs        | 277 +++++++++++++
+ .../UnrealBuildTool/ToolChain/UEToolChain.cs  |  25 ++
+ .../UnrealBuildTool/UnrealBuildTool.csproj    |   2 +
+ 8 files changed, 730 insertions(+), 3 deletions(-)
+ create mode 100644 Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFile.cs
+ create mode 100644 Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFileGenerator.cs
+
+diff --git a/Engine/Source/Programs/UnrealBuildTool/Configuration/UEBuildTarget.cs b/Engine/Source/Programs/UnrealBuildTool/Configuration/UEBuildTarget.cs
+index 97a937d41af1b..947ac655a516e 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/Configuration/UEBuildTarget.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/Configuration/UEBuildTarget.cs
+@@ -2098,7 +2098,7 @@ List<RestrictedFolder> GetRestrictedFolders(FileReference File)
+ 		/// Creates a toolchain for the current target. May be overridden by the target rules.
+ 		/// </summary>
+ 		/// <returns>New toolchain instance</returns>
+-		private UEToolChain CreateToolchain(UnrealTargetPlatform Platform)
++		public UEToolChain CreateToolchain(UnrealTargetPlatform Platform)
+ 		{
+ 			if (Rules.ToolChainName == null)
+ 			{
+diff --git a/Engine/Source/Programs/UnrealBuildTool/Modes/GenerateProjectFilesMode.cs b/Engine/Source/Programs/UnrealBuildTool/Modes/GenerateProjectFilesMode.cs
+index a42da4931c523..f6d05618f8ff0 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/Modes/GenerateProjectFilesMode.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/Modes/GenerateProjectFilesMode.cs
+@@ -36,6 +36,7 @@ class GenerateProjectFilesMode : ToolMode
+ 		[CommandLine("-EddieProjectFiles", Value = nameof(ProjectFileFormat.Eddie))]
+ 		[CommandLine("-VSCode", Value = nameof(ProjectFileFormat.VisualStudioCode))]
+ 		[CommandLine("-VSMac", Value = nameof(ProjectFileFormat.VisualStudioMac))]
++		[CommandLine("-VSWorkspace", Value = nameof(ProjectFileFormat.VisualStudioWorkspace))]
+ 		[CommandLine("-CLion", Value = nameof(ProjectFileFormat.CLion))]
+ 		[CommandLine("-Rider", Value = nameof(ProjectFileFormat.Rider))]
+ 		HashSet<ProjectFileFormat> ProjectFileFormats = new HashSet<ProjectFileFormat>();
+@@ -184,6 +185,9 @@ public override int Execute(CommandLineArguments Arguments)
+ 					case ProjectFileFormat.VisualStudioCode:
+ 						Generator = new VSCodeProjectFileGenerator(ProjectFile);
+ 						break;
++					case ProjectFileFormat.VisualStudioWorkspace:
++						Generator = new VSWorkspaceProjectFileGenerator(ProjectFile, Arguments);
++						break;
+ 					case ProjectFileFormat.CLion:
+ 						Generator = new CLionGenerator(ProjectFile);
+ 						break;
+diff --git a/Engine/Source/Programs/UnrealBuildTool/Platform/Windows/VCToolChain.cs b/Engine/Source/Programs/UnrealBuildTool/Platform/Windows/VCToolChain.cs
+index e526fa7ee2e4c..9e776964c8431 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/Platform/Windows/VCToolChain.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/Platform/Windows/VCToolChain.cs
+@@ -46,6 +46,11 @@ public VCToolChain(ReadOnlyTargetRules Target)
+ 			}
+ 		}
+ 
++		public override FileReference GetCppCompilerPath()
++		{
++			return EnvVars.CompilerPath;
++		}
++
+ 		/// <summary>
+ 		/// Prepares the environment for building
+ 		/// </summary>
+@@ -151,6 +156,27 @@ public static void AddSystemIncludePath(List<string> Arguments, DirectoryReferen
+ 		}
+ 
+ 
++		public override IEnumerable<string> GetGlobalCommandLineArgs(CppCompileEnvironment CompileEnvironment)
++		{
++			List<string> Arguments = new List<string>();
++			AppendCLArguments_Global(new CppCompileEnvironment(CompileEnvironment), Arguments);
++			return Arguments;
++		}
++
++		public override IEnumerable<string> GetCPPCommandLineArgs(CppCompileEnvironment CompileEnvironment)
++		{
++			List<string> Arguments = new List<string>();
++			AppendCLArguments_CPP(CompileEnvironment, Arguments);
++			return Arguments;
++		}
++
++		public override IEnumerable<string> GetCCommandLineArgs(CppCompileEnvironment CompileEnvironment)
++		{
++			List<string> Arguments = new List<string>();
++			AppendCLArguments_C(Arguments);
++			return Arguments;
++		}
++
+ 		protected virtual void AppendCLArguments_Global(CppCompileEnvironment CompileEnvironment, List<string> Arguments)
+ 		{
+ 			// Suppress generation of object code for unreferenced inline functions. Enabling this option is more standards compliant, and causes a big reduction
+diff --git a/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/ProjectFileGenerator.cs b/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/ProjectFileGenerator.cs
+index 66a1ec6d0b227..f64a010b97581 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/ProjectFileGenerator.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/ProjectFileGenerator.cs
+@@ -135,6 +135,7 @@ enum ProjectFileFormat
+ 		VisualStudio2017,
+ 		VisualStudio2019,
+ 		VisualStudio2022,
++		VisualStudioWorkspace,
+ 		XCode,
+ 		Eddie,
+ 		VisualStudioCode,
+@@ -2234,7 +2235,7 @@ private ProjectFile FindProjectForModule(FileReference CurModuleFile, List<FileR
+ 		/// <param name="EnterpriseProject">The enterprise project we created</param>
+ 		/// <param name="GameProjects">Map of game folder name to all of the game projects we created</param>
+ 		/// <param name="ProgramProjects">Map of program names to all of the program projects we created</param>
+-		private void AddProjectsForAllTargets(
++		protected void AddProjectsForAllTargets(
+ 			PlatformProjectGeneratorCollection PlatformProjectGenerators,
+ 			List<FileReference> AllGames,
+ 			List<FileReference> AllTargetFiles,
+@@ -2586,7 +2587,7 @@ protected void AddProjectsForMods(List<ProjectFile> GameProjects, out List<Proje
+ 		/// </summary>
+ 		/// <param name="BaseName">The base name for the project file</param>
+ 		/// <returns>Full path to the project file</returns>
+-		protected FileReference GetProjectLocation(string BaseName)
++		protected virtual FileReference GetProjectLocation(string BaseName)
+ 		{
+ 			return FileReference.Combine(IntermediateProjectFilesPath, BaseName + ProjectFileExtension);
+ 		}
+diff --git a/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFile.cs b/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFile.cs
+new file mode 100644
+index 0000000000000..fb5dffb1ef446
+--- /dev/null
++++ b/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFile.cs
+@@ -0,0 +1,392 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text;
++using Tools.DotNETCommon;
++
++namespace UnrealBuildTool
++{
++	internal class VSWorkspaceProjectFile : ProjectFile
++	{
++		private readonly DirectoryReference RootPath;
++		private readonly HashSet<TargetType> TargetTypes;
++		private readonly CommandLineArguments Arguments;
++		private VCProjectFileSettings Settings;
++		private bool bUsePrecompiled;
++
++		/// <summary>
++		/// Collection of output files for this project
++		/// </summary>
++		public List<ExportedTargetInfo> ExportedTargetProjects { get; set; } = new List<ExportedTargetInfo>();
++
++		public VSWorkspaceProjectFile(FileReference InProjectFilePath,
++			DirectoryReference RootPath, HashSet<TargetType> TargetTypes, CommandLineArguments Arguments, VCProjectFileSettings Settings, bool bUsePrecompiled)
++			: base(InProjectFilePath)
++		{
++			this.RootPath = RootPath;
++			this.TargetTypes = TargetTypes;
++			this.Arguments = Arguments;
++			this.Settings = Settings;
++			this.bUsePrecompiled = bUsePrecompiled;
++		}
++
++		/// <summary>
++		/// Write project file info in JSON file.
++		/// For every combination of <c>UnrealTargetPlatform</c>, <c>UnrealTargetConfiguration</c> and <c>TargetType</c>
++		/// will be generated separate JSON file.
++		/// </summary>
++		public bool WriteProjectFile(List<UnrealTargetPlatform> InPlatforms,
++			List<UnrealTargetConfiguration> InConfigurations,
++			PlatformProjectGeneratorCollection PlatformProjectGenerators, JsonWriterStyle Minimize)
++		{
++			DirectoryReference ProjectRootFolder = RootPath;
++
++			Dictionary<FileReference, Tuple<UEBuildTarget, bool>> FileToTarget = new Dictionary<FileReference, Tuple<UEBuildTarget, bool>>();
++
++			foreach (UnrealTargetPlatform Platform in InPlatforms)
++			{
++				foreach (UnrealTargetConfiguration Configuration in InConfigurations)
++				{
++					foreach (ProjectTarget ProjectTarget in ProjectTargets.OfType<ProjectTarget>())
++					{
++						if (TargetTypes.Any() && !TargetTypes.Contains(ProjectTarget.TargetRules.Type))
++						{
++							continue;
++						}
++
++						// Skip Programs for all configs except for current platform + Development & Debug configurations
++						if (ProjectTarget.TargetRules.Type == TargetType.Program &&
++							(BuildHostPlatform.Current.Platform != Platform ||
++							 !(Configuration == UnrealTargetConfiguration.Development || Configuration == UnrealTargetConfiguration.Debug)))
++						{
++							continue;
++						}
++
++						// Skip Editor for all platforms except for current platform
++						if (ProjectTarget.TargetRules.Type == TargetType.Editor &&
++							(BuildHostPlatform.Current.Platform != Platform ||
++							(Configuration == UnrealTargetConfiguration.Test || Configuration == UnrealTargetConfiguration.Shipping)))
++						{
++							continue;
++						}
++
++						bool bBuildByDefault = ShouldBuildByDefaultForSolutionTargets && ProjectTarget.SupportedPlatforms.Contains(Platform);
++
++						string DefaultArchitecture = UEBuildPlatform
++							.GetBuildPlatform(Platform)
++							.GetDefaultArchitecture(ProjectTarget.UnrealProjectFilePath);
++
++						TargetDescriptor TargetDesc = new TargetDescriptor(ProjectTarget.UnrealProjectFilePath, ProjectTarget.Name,
++							Platform, Configuration, DefaultArchitecture, Arguments);
++
++						try
++						{
++							FileReference OutputFile = FileReference.Combine(ProjectRootFolder,
++								$"{ProjectTarget.TargetFilePath.GetFileNameWithoutAnyExtensions()}_{Configuration}_{Platform}.json");
++
++							UEBuildTarget BuildTarget = UEBuildTarget.Create(TargetDesc, false, false);
++							FileToTarget.Add(OutputFile, new Tuple<UEBuildTarget, bool>(BuildTarget, bBuildByDefault));
++						}
++						catch (Exception Ex)
++						{
++							Log.TraceWarning("Exception while generating include data for Target:{0}, Platform: {1}, Configuration: {2}",
++								TargetDesc.Name, Platform.ToString(), Configuration.ToString());
++							Log.TraceWarning(Ex.ToString());
++						}
++					}
++				}
++			}
++
++			foreach (var Entry in FileToTarget)
++			{
++				var OutputFile = Entry.Key;
++				var BuildTarget = Entry.Value.Item1;
++				var bBuildByDefault = Entry.Value.Item2;
++
++				try
++				{
++					BuildTarget.PreBuildSetup();
++
++					ExportedTargetInfo TargetInfo = ExportTarget(BuildTarget, bBuildByDefault, PlatformProjectGenerators);
++
++					// Need a workaround to escape the keys of the DirToModule dictionary, which is not done automatically
++					// when serializing, resulting in an invalid JSON content.
++					TargetInfo.DirToModule = TargetInfo.DirToModule.ToDictionary(x => Json.EscapeString(x.Key), x => x.Value);
++
++					DirectoryReference.CreateDirectory(OutputFile.Directory);
++
++					JsonSerializeOptions Options = Minimize == JsonWriterStyle.Readable
++						? JsonSerializeOptions.PrettyPrint : JsonSerializeOptions.None;
++					File.WriteAllText(OutputFile.FullName, Json.Serialize(TargetInfo, Options));
++
++					ExportedTargetProjects.Add(TargetInfo);
++				}
++				catch (Exception Ex)
++				{
++					Log.TraceWarning("Exception while generating include data for Target:{Target}, Platform: {Platform}, Configuration: {Configuration}",
++						BuildTarget.AppName, BuildTarget.Platform.ToString(), BuildTarget.Configuration.ToString());
++					Log.TraceWarning("{Ex}", Ex.ToString());
++				}
++			}
++
++			return true;
++		}
++
++		private ExportedTargetInfo ExportTarget(
++			UEBuildTarget Target, bool bBuildByDefault, PlatformProjectGeneratorCollection PlatformProjectGenerators)
++		{
++			ExportedTargetInfo TargetInfo = new ExportedTargetInfo()
++			{
++				TargetName = Target.TargetName,
++				TargetPath = Target.TargetRulesFile.FullName,
++				ProjectPath = Target.ProjectFile?.FullName ?? String.Empty,
++				TargetType = Target.TargetType.ToString(),
++				Platform = Target.Platform.ToString(),
++				Configuration = Target.Configuration.ToString(),
++				BuildInfo = ExportBuildInfo(Target, PlatformProjectGenerators, bBuildByDefault)
++			};
++
++			UEToolChain TargetToolChain = Target.CreateToolchain(Target.Platform);
++			CppCompileEnvironment GlobalCompileEnvironment = Target.CreateCompileEnvironmentForProjectFiles();
++
++			HashSet<string> ModuleNames = new HashSet<string>();
++			foreach (UEBuildBinary Binary in Target.Binaries)
++			{
++				CppCompileEnvironment BinaryCompileEnvironment = Binary.CreateBinaryCompileEnvironment(GlobalCompileEnvironment);
++				IEnumerable<UEBuildModuleCPP> CandidateModules = Binary.Modules.Where(x => x is UEBuildModuleCPP).Cast<UEBuildModuleCPP>();
++
++				foreach (var ModuleCpp in CandidateModules)
++				{
++					if (!ModuleNames.Add(ModuleCpp.Name))
++					{
++						continue;
++					}
++
++					CppCompileEnvironment ModuleCompileEnvironment = ModuleCpp.CreateCompileEnvironmentForIntellisense(Target.Rules, BinaryCompileEnvironment);
++					TargetInfo.ModuleToCompileSettings.Add(ModuleCpp.Name, ExportModule(ModuleCpp, TargetToolChain, ModuleCompileEnvironment));
++
++					foreach (DirectoryReference ModuleDirectory in ModuleCpp.ModuleDirectories)
++					{
++						if (!TargetInfo.DirToModule.ContainsKey(ModuleDirectory.FullName))
++						{
++							TargetInfo.DirToModule.Add(ModuleDirectory.FullName, ModuleCpp.Name);
++						}
++					}
++
++					if (ModuleCpp.GeneratedCodeDirectory != null)
++					{
++						if (!TargetInfo.DirToModule.ContainsKey(ModuleCpp.GeneratedCodeDirectory.FullName))
++						{
++							TargetInfo.DirToModule.Add(ModuleCpp.GeneratedCodeDirectory.FullName, ModuleCpp.Name);
++						}
++					}
++				}
++			}
++
++			return TargetInfo;
++		}
++
++		private static ExportedModuleInfo ExportModule(UEBuildModuleCPP Module, UEToolChain TargetToolChain, CppCompileEnvironment ModuleCompileEnvironment)
++		{
++			ExportedModuleInfo Result = new ExportedModuleInfo()
++			{
++				Name = Module.Name,
++				Directory = Module.ModuleDirectory.FullName,
++				Rules = Module.RulesFile.FullName,
++				GeneratedCodeDirectory = Module.GeneratedCodeDirectory != null ? Module.GeneratedCodeDirectory.FullName : String.Empty,
++				Standard = ModuleCompileEnvironment.CppStandard.ToString(),
++			};
++
++			Result.IncludePaths.AddRange(Module.PublicIncludePaths.Select(x => x.FullName));
++			Result.IncludePaths.AddRange(Module.PublicSystemIncludePaths.Select(x => x.FullName));
++			Result.IncludePaths.AddRange(Module.LegacyPublicIncludePaths.Select(x => x.FullName));
++			Result.IncludePaths.AddRange(Module.PrivateIncludePaths.Select(x => x.FullName));
++
++			Result.IncludePaths.AddRange(ModuleCompileEnvironment.UserIncludePaths.Select(x => x.FullName));
++
++			Result.IncludePaths.AddRange(Module.PublicSystemLibraryPaths.Select(x => x.FullName));
++			Result.IncludePaths.AddRange(Module.PublicSystemLibraries.Concat(Module.PublicLibraries.Select(x => x.FullName)));
++
++			VCToolChain TargetVCToolChain = TargetToolChain as VCToolChain;
++			if (TargetToolChain != null)
++			{
++				string VCIncludePaths = VCToolChain.GetVCIncludePaths(ModuleCompileEnvironment.Platform, WindowsCompiler.VisualStudio2022, null);
++				Result.IncludePaths.AddRange(VCIncludePaths.Split(';'));
++			}
++
++			Result.Defines.AddRange(Module.PublicDefinitions);
++			Result.Defines.AddRange(Module.Rules.PrivateDefinitions);
++			Result.Defines.AddRange(Module.Rules.bTreatAsEngineModule ? Array.Empty<string>() : Module.Rules.Target.ProjectDefinitions);
++			Result.Defines.AddRange(Module.GetEmptyApiMacros());
++
++			var ForcedIncludes = ModuleCompileEnvironment.ForceIncludeFiles.ToList();
++			if (ModuleCompileEnvironment.PrecompiledHeaderAction == PrecompiledHeaderAction.Include)
++			{
++				FileItem IncludeHeader = FileItem.GetItemByFileReference(ModuleCompileEnvironment.PrecompiledHeaderIncludeFilename);
++				ForcedIncludes.Insert(0, IncludeHeader);
++			}
++
++			Result.ForcedIncludes.AddRange(ForcedIncludes.Select(x => x.FullName));
++
++			Result.CompilerPath = TargetToolChain.GetCppCompilerPath()?.ToString();
++			Result.CompilerArgs.AddRange(TargetToolChain.GetGlobalCommandLineArgs(ModuleCompileEnvironment));
++			Result.CompilerAdditionalArgs.Add("c", TargetToolChain.GetCCommandLineArgs(ModuleCompileEnvironment).ToList());
++			Result.CompilerAdditionalArgs.Add("cpp", TargetToolChain.GetCPPCommandLineArgs(ModuleCompileEnvironment).ToList());
++
++			return Result;
++		}
++
++		private TargetBuildInfo ExportBuildInfo(UEBuildTarget Target, PlatformProjectGeneratorCollection PlatformProjectGenerators, bool bBuildByDefault)
++		{
++			if (!BuildHostPlatform.Current.Platform.IsInGroup(UnrealPlatformGroup.Windows))
++			{
++				Log.TraceWarning("Unsupported platform for Build Information: {Platform}", BuildHostPlatform.Current.Platform.ToString());
++				return null;
++			}
++
++			if (IsStubProject)
++			{
++				return null;
++			}
++
++			ProjectTarget ProjectTarget = ProjectTargets.OfType<ProjectTarget>().Single(It => Target.TargetRulesFile == It.TargetFilePath);
++			UnrealTargetPlatform Platform = Target.Platform;
++			UnrealTargetConfiguration Configuration = Target.Configuration;
++
++			string UProjectPath = "";
++			if (IsForeignProject)
++			{
++				UProjectPath = String.Format("\"{0}\"", ProjectTarget.UnrealProjectFilePath.FullName);
++			}
++
++			PlatformProjectGenerator ProjGenerator = PlatformProjectGenerators.GetPlatformProjectGenerator(Platform, true);
++
++			string BuildArguments = GetBuildArguments(ProjGenerator, ProjectTarget, Target, UProjectPath);
++
++			return new TargetBuildInfo()
++			{
++				BuildCmd = $"{GetBuildScript("Build")} {BuildArguments}",
++				RebuildCmd = $"{GetBuildScript("Rebuild")} {BuildArguments}",
++				CleanCmd = $"{GetBuildScript("Clean")} {BuildArguments}",
++				PrimaryOutput = Target.Binaries[0].OutputFilePath.FullName,
++				BuildByDefault = bBuildByDefault,
++			};
++		}
++
++		private string GetBuildScript(string Cmd)
++		{
++			DirectoryReference BatchFilesDirectory = DirectoryReference.Combine(UnrealBuildTool.EngineDirectory, "Build", "BatchFiles");
++			return EscapePath(FileReference.Combine(BatchFilesDirectory, $"{Cmd}.bat").FullName);
++		}
++
++		private string GetBuildArguments(
++			PlatformProjectGenerator ProjGenerator, ProjectTarget ProjectTarget, UEBuildTarget Target, string UProjectPath)
++		{
++			UnrealTargetConfiguration Configuration = Target.Configuration;
++			UnrealTargetPlatform Platform = Target.Platform;
++			string TargetName = ProjectTarget.TargetFilePath.GetFileNameWithoutAnyExtensions();
++			TargetRules TargetRulesObject = ProjectTarget.TargetRules;
++
++			// This is the standard UE based project NMake build line:
++			//	..\..\Build\BatchFiles\Build.bat <TARGETNAME> <PLATFORM> <CONFIGURATION>
++			//	ie ..\..\Build\BatchFiles\Build.bat BlankProgram Win64 Debug
++
++			StringBuilder BuildArguments = new StringBuilder();
++
++			BuildArguments.AppendFormat("{0} {1} {2}", TargetName, Configuration, Platform);
++			if (IsForeignProject)
++			{
++				BuildArguments.AppendFormat(" -Project={0}", UProjectPath);
++			}
++
++			List<string> ExtraTargets = new List<string>();
++			if (!bUsePrecompiled)
++			{
++				if (TargetRulesObject.Type == TargetType.Editor && Settings.bEditorDependsOnShaderCompileWorker && !UnrealBuildTool.IsEngineInstalled())
++				{
++					ExtraTargets.Add("ShaderCompileWorker Win64 Development");
++				}
++				if (TargetRulesObject.bWithLiveCoding && Settings.bBuildLiveCodingConsole && !UnrealBuildTool.IsEngineInstalled() && TargetRulesObject.Name != "LiveCodingConsole")
++				{
++					ExtraTargets.Add(TargetRulesObject.bUseDebugLiveCodingConsole ? "LiveCodingConsole Win64 Debug" : "LiveCodingConsole Win64 Development");
++				}
++			}
++
++			if (ExtraTargets.Count > 0)
++			{
++				BuildArguments.Replace("\"", "\\\"");
++				BuildArguments.Insert(0, "-Target=\"");
++				BuildArguments.Append("\"");
++				foreach (string ExtraTarget in ExtraTargets)
++				{
++					BuildArguments.AppendFormat(" -Target=\"{0} -Quiet\"", ExtraTarget);
++				}
++			}
++
++			if (bUsePrecompiled)
++			{
++				BuildArguments.Append(" -UsePrecompiled");
++			}
++
++			// Always wait for the mutex between UBT invocations, so that building the whole solution doesn't fail.
++			BuildArguments.Append(" -WaitMutex");
++
++			// Always include a flag to format log messages for MSBuild
++			BuildArguments.Append(" -FromMsBuild");
++
++			if (Settings.bAddFastPDBToProjects)
++			{
++				// Pass Fast PDB option to make use of Visual Studio's /DEBUG:FASTLINK option
++				BuildArguments.Append(" -FastPDB");
++			}
++
++			if (ProjGenerator != null)
++			{
++				BuildArguments.Append(ProjGenerator.GetExtraBuildArguments(Platform, Configuration));
++			}
++
++			return BuildArguments.ToString();
++		}
++
++		internal class ExportedTargetInfo
++		{
++			public string TargetName { get; set; } = String.Empty;
++			public string TargetPath { get; set; } = String.Empty;
++			public string ProjectPath { get; set; } = String.Empty;
++			public string TargetType { get; set; } = String.Empty;
++			public string Platform { get; set; } = String.Empty;
++			public string Configuration { get; set; } = String.Empty;
++			public TargetBuildInfo BuildInfo { get; set; }
++			public Dictionary<string, ExportedModuleInfo> ModuleToCompileSettings { get; set; } = new Dictionary<string, ExportedModuleInfo>();
++			public Dictionary<string, string> DirToModule { get; set; } = new Dictionary<string, string>();
++		}
++
++		internal class ExportedModuleInfo
++		{
++			public string Name { get; set; } = String.Empty;
++			public string Directory { get; set; } = String.Empty;
++			public string Rules { get; set; } = String.Empty;
++			public string GeneratedCodeDirectory { get; set; } = String.Empty;
++			public List<string> IncludePaths { get; set; } = new List<string>();
++			public List<string> Defines { get; set; } = new List<string>();
++			public string Standard { get; set; }
++			public List<string> ForcedIncludes { get; set; } = new List<string>();
++			public string CompilerPath { get; set; }
++			public List<string> CompilerArgs { get; set; } = new List<string>();
++			public Dictionary<string, List<string>> CompilerAdditionalArgs { get; set; } = new Dictionary<string, List<string>>();
++			public string WindowsSdkVersion { get; set; }
++		}
++
++		internal class TargetBuildInfo
++		{
++			public string BuildCmd { get; set; } = String.Empty;
++			public string RebuildCmd { get; set; } = String.Empty;
++			public string CleanCmd { get; set; } = String.Empty;
++			public string PrimaryOutput { get; set; } = String.Empty;
++			public bool BuildByDefault { get; internal set; }
++		}
++	}
++}
+diff --git a/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFileGenerator.cs b/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFileGenerator.cs
+new file mode 100644
+index 0000000000000..df430da977f9e
+--- /dev/null
++++ b/Engine/Source/Programs/UnrealBuildTool/ProjectFiles/VisualStudioWorkspace/VSWorkspaceProjectFileGenerator.cs
+@@ -0,0 +1,277 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text.RegularExpressions;
++using Tools.DotNETCommon;
++
++namespace UnrealBuildTool
++{
++	class VSWorkspaceMasterProjectFolder : MasterProjectFolder
++	{
++		public VSWorkspaceMasterProjectFolder(ProjectFileGenerator InitOwnerProjectFileGenerator, string InitFolderName) :
++			base(InitOwnerProjectFileGenerator, InitFolderName)
++		{
++		}
++	}
++
++	class VSWorkspaceProjectFileGenerator : ProjectFileGenerator
++	{
++		public override string ProjectFileExtension => ".json";
++
++		// These properties are used by Visual Studio to determine where to read the project files.
++		// So they must remain constant.
++		private const string VSUnrealWorkspaceFileName = ".vs-unreal-workspace";
++		private const string ProjectFilesFolder = "VisualStudio";
++
++		private readonly CommandLineArguments Arguments;
++
++		/// <summary>
++		/// List of deprecated platforms.
++		/// Don't generate project model for these platforms unless they are specified in "Platforms" console arguments. 
++		/// </summary>
++		/// <returns></returns>
++		private readonly HashSet<UnrealTargetPlatform> DeprecatedPlatforms = new HashSet<UnrealTargetPlatform>();
++
++		/// <summary>
++		/// Platforms to generate project files for
++		/// </summary>
++		[CommandLine("-Platforms=", ListSeparator = '+')]
++		HashSet<UnrealTargetPlatform> Platforms = new HashSet<UnrealTargetPlatform>();
++
++		/// <summary>
++		/// Target types to generate project files for
++		/// </summary>
++		[CommandLine("-TargetTypes=", ListSeparator = '+')]
++		HashSet<TargetType> TargetTypes = new HashSet<TargetType>();
++
++		/// <summary>
++		/// Target configurations to generate project files for
++		/// </summary>
++		[CommandLine("-TargetConfigurations=", ListSeparator = '+')]
++		HashSet<UnrealTargetConfiguration> TargetConfigurations = new HashSet<UnrealTargetConfiguration>();
++
++		/// <summary>
++		/// Projects to generate project files for
++		/// </summary>
++		[CommandLine("-ProjectNames=", ListSeparator = '+')]
++		HashSet<string> ProjectNames = new HashSet<string>();
++
++		/// <summary>
++		/// Should format JSON files in human readable form, or use packed one without indents
++		/// </summary>
++		[CommandLine("-Minimize", Value = "Compact")]
++		private JsonWriterStyle Minimize = JsonWriterStyle.Readable;
++
++		/// <summary>
++		/// The settings object
++		/// </summary>
++		protected VCProjectFileSettings Settings = new VCProjectFileSettings();
++
++		public VSWorkspaceProjectFileGenerator(FileReference InOnlyGameProject,
++			CommandLineArguments InArguments)
++			: base(InOnlyGameProject)
++		{
++			Arguments = InArguments;
++			Arguments.ApplyTo(this);
++			XmlConfig.ApplyTo(Settings);
++		}
++
++		public override bool ShouldGenerateIntelliSenseData() => true;
++
++		public override void CleanProjectFiles(DirectoryReference InPrimaryProjectDirectory, string InPrimaryProjectName,
++			DirectoryReference InIntermediateProjectFilesDirectory)
++		{
++			DirectoryReference.Delete(InPrimaryProjectDirectory);
++		}
++
++		protected override void ConfigureProjectFileGeneration(string[] Arguments, ref bool IncludeAllPlatforms)
++		{
++			base.ConfigureProjectFileGeneration(Arguments, ref IncludeAllPlatforms);
++		}
++
++		protected override ProjectFile AllocateProjectFile(FileReference InitFilePath)
++		{
++			VSWorkspaceProjectFile projectFile = new VSWorkspaceProjectFile(InitFilePath, InitFilePath.Directory,
++				TargetTypes, Arguments, Settings, bUsePrecompiled);
++			return projectFile;
++		}
++
++		public override MasterProjectFolder AllocateMasterProjectFolder(ProjectFileGenerator OwnerProjectFileGenerator,
++			string FolderName)
++		{
++			return new VSWorkspaceMasterProjectFolder(OwnerProjectFileGenerator, FolderName);
++		}
++
++		protected override bool WriteProjectFiles(PlatformProjectGeneratorCollection PlatformProjectGenerators)
++		{
++			using (ProgressWriter Progress = new ProgressWriter("Writing project files...", true))
++			{
++				List<ProjectFile> ProjectsToGenerate = new List<ProjectFile>(GeneratedProjectFiles);
++				if (ProjectNames.Any())
++				{
++					ProjectsToGenerate = ProjectsToGenerate.Where(Project =>
++						ProjectNames.Contains(Project.ProjectFilePath.GetFileNameWithoutAnyExtensions())).ToList();
++				}
++
++				int TotalProjectFileCount = ProjectsToGenerate.Count;
++
++				HashSet<UnrealTargetPlatform> PlatformsToGenerate = new HashSet<UnrealTargetPlatform>(SupportedPlatforms);
++				if (Platforms.Any())
++				{
++					PlatformsToGenerate.IntersectWith(Platforms);
++				}
++
++				List<UnrealTargetPlatform> FilteredPlatforms = PlatformsToGenerate.Where(Platform =>
++				{
++					// Skip deprecated unless explicitly specified in the command line.
++					return (!DeprecatedPlatforms.Contains(Platform) || Platforms.Contains(Platform))
++						   && UEBuildPlatform.IsPlatformAvailable(Platform)
++						   && IsPlatformInHostGroup(Platform);
++				}).ToList();
++
++				HashSet<UnrealTargetConfiguration> ConfigurationsToGenerate = new HashSet<UnrealTargetConfiguration>(SupportedConfigurations);
++				if (TargetConfigurations.Any())
++				{
++					ConfigurationsToGenerate.IntersectWith(TargetConfigurations);
++				}
++
++				List<UnrealTargetConfiguration> Configurations = ConfigurationsToGenerate.ToList();
++
++				for (int ProjectFileIndex = 0; ProjectFileIndex < ProjectsToGenerate.Count; ++ProjectFileIndex)
++				{
++					VSWorkspaceProjectFile CurrentProject = ProjectsToGenerate[ProjectFileIndex] as VSWorkspaceProjectFile;
++					if (CurrentProject == null)
++					{
++						return false;
++					}
++
++					if (!CurrentProject.WriteProjectFile(FilteredPlatforms, Configurations, PlatformProjectGenerators, Minimize))
++					{
++						return false;
++					}
++
++					Progress.Write(ProjectFileIndex + 1, TotalProjectFileCount);
++				}
++
++				Progress.Write(TotalProjectFileCount, TotalProjectFileCount);
++			}
++			
++			return true;
++		}
++
++		public override bool GenerateProjectFiles(PlatformProjectGeneratorCollection PlatformProjectGenerators,
++			String[] Arguments)
++		{
++			bool IncludeAllPlatforms = true;
++			ConfigureProjectFileGeneration(Arguments, ref IncludeAllPlatforms);
++
++			if (bGeneratingGameProjectFiles || UnrealBuildTool.IsEngineInstalled())
++			{
++				MasterProjectPath = OnlyGameProject.Directory;
++				MasterProjectName = OnlyGameProject.GetFileNameWithoutExtension();
++
++				IntermediateProjectFilesPath =
++					DirectoryReference.Combine(MasterProjectPath, "Intermediate", "ProjectFiles");
++			}
++
++			string SupportedPlatformNames;
++			SetupSupportedPlatformsAndConfigurations(IncludeAllPlatforms: true, SupportedPlatformNames: out SupportedPlatformNames);
++			Log.TraceVerbose("Supported platforms: {0}", SupportedPlatformNames);
++
++			List<FileReference> AllGames = FindGameProjects();
++
++			{
++				// Find all of the target files.
++				List<FileReference> AllTargetFiles = DiscoverTargets(AllGames);
++
++				// If there are multiple targets of a given type for a project, use the order to determine which one gets a suffix.
++				AllTargetFiles = AllTargetFiles.OrderBy(x => x.FullName, StringComparer.OrdinalIgnoreCase).ToList();
++
++				ProjectFile EngineProject = null;
++				ProjectFile EnterpriseProject = null;
++				List<ProjectFile> GameProjects; 
++				Dictionary<FileReference, ProjectFile> ProgramProjects;
++
++				AddProjectsForAllTargets(
++					PlatformProjectGenerators,
++					AllGames,
++					AllTargetFiles,
++					Arguments,
++					out EngineProject,
++					out EnterpriseProject,
++					out GameProjects,
++					out ProgramProjects);
++
++				AddAllGameProjects(GameProjects, SupportedPlatformNames, ProjectsFolder: null);
++			}
++
++			WriteProjectFiles(PlatformProjectGenerators);
++			WriteMasterProjectFile(UBTProject, PlatformProjectGenerators);
++
++			return true;
++		}
++
++		protected override bool WriteMasterProjectFile(ProjectFile UBTProject,
++			PlatformProjectGeneratorCollection PlatformProjectGenerators)
++		{
++			try
++			{
++				FileReference PrimaryProjectFile = FileReference.Combine(
++					IntermediateProjectFilesPath, ProjectFilesFolder, VSUnrealWorkspaceFileName);
++				DirectoryReference.CreateDirectory(PrimaryProjectFile.Directory);
++
++				// Collect all the resulting project files and aggregate the target-level data
++				var AggregatedProjectInfo = GeneratedProjectFiles
++					.Where(Project => Project is VSWorkspaceProjectFile)
++					.OfType<VSWorkspaceProjectFile>()
++					.SelectMany(Project => Project.ExportedTargetProjects)
++					.GroupBy(TargetProject => TargetProject.TargetName)
++					.Select(g => new
++					{
++						g.Key,
++						Target = new
++						{
++							TargetType = g.Select(i => i.TargetType).Distinct().Single(),
++							TargetPath = g.Select(i => i.TargetPath).Distinct().Single(),
++							ProjectPath = g.Select(i => i.ProjectPath).Distinct().Single(),
++							Configurations = g.Select(i => i.Configuration).Distinct().ToList(),
++							Platforms = g.Select(i => i.Platform).Distinct().ToList(),
++						}
++					});
++
++				// The inner Targets object is needed for schema compatibility with the Query Mode API.
++				var Result = new
++				{
++					Targets = AggregatedProjectInfo.ToDictionary(item => item.Key, item => item.Target)
++				};
++
++				JsonSerializeOptions Options = Minimize == JsonWriterStyle.Readable
++						? JsonSerializeOptions.PrettyPrint : JsonSerializeOptions.None;
++				File.WriteAllText(PrimaryProjectFile.FullName, Json.Serialize(Result, Options));
++			}
++			catch (Exception Ex)
++			{
++				Log.TraceWarning("Exception while writing root project file: {0}", Ex.ToString());
++				return false;
++			}
++
++			return true;
++		}
++
++		/// <inheritdoc />
++		protected override FileReference GetProjectLocation(string BaseName)
++		{
++			return FileReference.Combine(IntermediateProjectFilesPath, ProjectFilesFolder, BaseName + ProjectFileExtension);
++		}
++
++		private static bool IsPlatformInHostGroup(UnrealTargetPlatform Platform)
++		{
++			return UEBuildPlatform.GetPlatformGroups(BuildHostPlatform.Current.Platform)
++				.Where(Group => Group != UnrealPlatformGroup.Desktop)
++				.Any(Group => UEBuildPlatform.IsPlatformInGroup(Platform, Group));
++		}
++	}
++}
+diff --git a/Engine/Source/Programs/UnrealBuildTool/ToolChain/UEToolChain.cs b/Engine/Source/Programs/UnrealBuildTool/ToolChain/UEToolChain.cs
+index 731ca46cf79e2..7a3b6c2825883 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/ToolChain/UEToolChain.cs
++++ b/Engine/Source/Programs/UnrealBuildTool/ToolChain/UEToolChain.cs
+@@ -27,6 +27,17 @@ public virtual void GetExternalDependencies(HashSet<FileItem> ExternalDependenci
+ 		{
+ 		}
+ 
++		public static DirectoryReference GetModuleInterfaceDir(DirectoryReference OutputDir)
++		{
++			return DirectoryReference.Combine(OutputDir, "Ifc");
++		}
++
++		// Return the path to the cpp compiler that will be used by this toolchain.
++		public virtual FileReference GetCppCompilerPath()
++		{
++			return null;
++		}
++
+ 		public abstract CPPOutput CompileCPPFiles(CppCompileEnvironment CompileEnvironment, List<FileItem> InputFiles, DirectoryReference OutputDir, string ModuleName, IActionGraphBuilder Graph);
+ 
+ 		public virtual CPPOutput CompileRCFiles(CppCompileEnvironment Environment, List<FileItem> InputFiles, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+@@ -57,6 +68,20 @@ public virtual FileItem[] LinkAllFiles(LinkEnvironment LinkEnvironment, bool bBu
+ 			return new FileItem[] { LinkFiles(LinkEnvironment, bBuildImportLibraryOnly, Graph) };
+ 		}
+ 
++		public virtual IEnumerable<string> GetGlobalCommandLineArgs(CppCompileEnvironment CompileEnvironment)
++		{
++			return Array.Empty<string>();
++		}
++
++		public virtual IEnumerable<string> GetCPPCommandLineArgs(CppCompileEnvironment CompileEnvironment)
++		{
++			return Array.Empty<string>();
++		}
++
++		public virtual IEnumerable<string> GetCCommandLineArgs(CppCompileEnvironment CompileEnvironment)
++		{
++			return Array.Empty<string>();
++		}
+ 
+ 		/// <summary>
+ 		/// Get the name of the response file for the current linker environment and output file
+diff --git a/Engine/Source/Programs/UnrealBuildTool/UnrealBuildTool.csproj b/Engine/Source/Programs/UnrealBuildTool/UnrealBuildTool.csproj
+index 3b070a635e74e..51818e6fa3a08 100644
+--- a/Engine/Source/Programs/UnrealBuildTool/UnrealBuildTool.csproj
++++ b/Engine/Source/Programs/UnrealBuildTool/UnrealBuildTool.csproj
+@@ -193,6 +193,8 @@
+     <Compile Include="ProjectFiles\VisualStudio\VCProject.cs" />
+     <Compile Include="ProjectFiles\VisualStudio\VCProjectFileGenerator.cs" />
+     <Compile Include="ProjectFiles\VisualStudio\VCSolutionOptions.cs" />
++    <Compile Include="ProjectFiles\VisualStudioWorkspace\VSWorkspaceProjectFile.cs" />
++    <Compile Include="ProjectFiles\VisualStudioWorkspace\VSWorkspaceProjectFileGenerator.cs" />
+     <Compile Include="ProjectFiles\Xcode\XcodeFrameworkWrapperProject.cs" />
+     <Compile Include="ProjectFiles\Xcode\XcodeProject.cs" />
+     <Compile Include="ProjectFiles\Xcode\XcodeProjectFileGenerator.cs" />

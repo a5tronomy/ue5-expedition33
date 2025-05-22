@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "HordeServer": {
+      "commandName": "Project",
+      "commandLineArgs": "",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Local"
+      },
+      "hotReloadEnabled": false
+    }
+  }
+}

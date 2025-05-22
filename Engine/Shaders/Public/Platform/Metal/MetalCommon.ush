@@ -1,0 +1,120 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	MetalCommon.usf: Common Metal shader code
+=============================================================================*/
+
+#pragma once
+
+// Update this GUID to invalidate shader recompilation for only Metal shaders
+#pragma message("UESHADERMETADATA_VERSION E4FA73AD-5066-4067-8B47-814FDC0D6332")
+
+#if VERTEXSHADER && HULLSHADER
+#ifndef TESSELLATIONSHADER
+#define TESSELLATIONSHADER 1
+#endif
+#endif
+
+#define STRONG_TYPE
+#define StrongTypedBuffer Buffer
+
+#if METAL_SM6_PROFILE == 1
+    #define PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS 1
+    // Disable WaveVote due to bugs
+    #define COMPILER_SUPPORTS_WAVE_VOTE 0
+#endif
+
+#if IS_BASE_PASS && COMPUTE_SHADED && !defined(USE_FORCE_TEXTURE_MIP)
+	#define USE_FORCE_TEXTURE_MIP 1
+#endif
+
+/* Too many bugs to enable wave-intrinsics just yet, but we are getting there.
+#if COMPUTESHADER || PIXELSHADER
+#define COMPILER_SUPPORTS_WAVE_ONCE 1
+#define COMPILER_SUPPORTS_WAVE_VOTE 1
+#define COMPILER_SUPPORTS_WAVE_MINMAX 1
+#define COMPILER_SUPPORTS_WAVE_BIT_ORAND 1
+#endif
+*/
+
+#define COMPILER_SUPPORTS_MINMAX3 0
+
+#if IOS && PIXELSHADER 
+	// The load operation here will be patched by the MetalShaderCompiler,
+	// do NOT change any character in the "SubpassFetch*" macro definition, including white spaces!
+	
+	// 4 components: RGBA_0
+	Texture2D<float4> gl_LastFragDataRGBA_0;
+	#define SubpassFetchRGBA_0() gl_LastFragDataRGBA_0.Load(uint3(0, 0, 0), 0)
+	// 1 component: R_4
+	Texture2D<float> gl_LastFragDataR_4;
+	#define SubpassFetchR_4() gl_LastFragDataR_4.Load(uint3(0, 0, 0), 0)
+
+	Texture2D<float> gl_LastFragDataR_1;
+	#define SubpassFetchR_1() gl_LastFragDataR_1.Load(uint3(0, 0, 0), 0)
+	//
+	// Rest of SubpassFetch can be found in MetalSubpassSupport.ush
+	//
+	#if MOBILE_DEFERRED_SHADING
+		#define DepthbufferFetchES2() SubpassFetchR_4()
+	#else
+		#define DepthbufferFetchES2() SubpassFetchR_1()
+	#endif
+#else
+	#define SubpassFetchRGBA_0() ((float4)0.0)
+	#define SubpassFetchR_0() (0.0)
+	#define SubpassFetchR_4() (0.0)
+#endif //IOS && PIXELSHADER
+
+#if METAL_SM6_PROFILE == 1
+    #define COMPILER_SUPPORTS_ULONG_TYPES 1
+    #define COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS 1
+
+    #if COMPILER_SUPPORTS_ULONG_TYPES
+        #define UlongType uint64_t
+
+        UlongType PackUlongType(uint2 Value)
+        {
+            return ((UlongType)Value.y << 32) | Value.x;
+        }
+
+        uint2 UnpackUlongType(UlongType Value)
+        {
+            return uint2(uint(Value), uint(Value >> 32));
+        }
+    #endif
+
+    #if COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS
+        void ImageInterlockedMaxUInt64(RWTexture2D<UlongType> Dest, uint2 Coord, UlongType Value)
+        {
+            InterlockedMax(Dest[Coord], Value);
+        }
+    #endif
+    
+    #if PLATFORM_SUPPORTS_BINDLESS
+        #define GetResourceFromHeap(Type, Index) ResourceDescriptorHeap[Index]
+        #define GetSamplerFromHeap(Type, Index) SamplerDescriptorHeap[Index]
+    #endif
+#endif
+
+#if PLATFORM_SUPPORTS_MESH_SHADERS_TIER0
+    #define MESH_SHADER_TRIANGLE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("triangle")]
+    #define MESH_SHADER_LINE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("line")]
+
+    #define AMPLIFICATION_SHADER_TRIANGLE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("triangle")]
+    #define AMPLIFICATION_SHADER_LINE_ATTRIBUTES(InThreadsX) [numthreads(InThreadsX, 1, 1)][outputtopology("line")]
+
+    #define MESH_SHADER_VERTEX_EXPORT(VertexType, InMaxVertexCount) out vertices VertexType OutVertices[InMaxVertexCount]
+    #define MESH_SHADER_TRIANGLE_EXPORT(InMaxTriangleCount) out indices uint3 OutTriangles[InMaxTriangleCount]
+    #define MESH_SHADER_LINE_EXPORT(InMaxLineCount) out indices uint2 OutLines[InMaxLineCount]
+
+    #define MESH_SHADER_WRITE_VERTEX(InVertexIndex, Value) OutVertices[InVertexIndex] = Value;
+    #define MESH_SHADER_WRITE_TRIANGLE(InTriangleIndex, Value) OutTriangles[InTriangleIndex] = Value;
+    #define MESH_SHADER_WRITE_LINE(InLineIndex, Value) OutLines[InLineIndex] = Value;
+#endif
+
+#if PLATFORM_SUPPORTS_MESH_SHADERS_TIER1
+    #define MESH_SHADER_PRIMITIVE_EXPORT(PrimitiveType, InMaxPrimitiveCount) out primitives PrimitiveType OutPrimitives[InMaxPrimitiveCount]
+
+    #define MESH_SHADER_WRITE_PRIMITIVE(InPrimitiveIndex, Value) OutPrimitives[InPrimitiveIndex] = Value;
+#endif

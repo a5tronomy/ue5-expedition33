@@ -1,0 +1,60 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../HTileEncoding.ush"
+
+#ifdef OVERRIDE_RTWRITEMASKPROCESSING_USH
+#include "/Platform/Private/RTWriteMaskLookup.ush"
+#endif
+
+#include "NaniteDataDecode.ush"
+#include "NaniteAttributeDecode.ush"
+
+uint4 ViewRect;
+
+RWByteAddressBuffer OutCMaskBuffer;
+RWTexture2D<uint> OutVisualized;
+
+[numthreads(8, 8, 1)]
+void VisualizeClearTilesCS(uint2 GroupId : SV_GroupID, uint ThreadIndex : SV_GroupIndex)
+{
+#ifdef OVERRIDE_RTWRITEMASKPROCESSING_USH
+	const uint2 PixelLocalPos = SwizzleThreadIndex(ThreadIndex & 63u);
+	const uint2 PixelPos = ((GroupId << 3) | PixelLocalPos) + ViewRect.xy;
+
+	if (any(PixelPos.xy >= ViewRect.zw))
+	{
+		return;
+	}
+
+	// Compute memory location (byte address and tile bit shift offset) of the
+	// cmask data mapped to this pixel position.
+	uint Index, Shift;
+	const uint2 TileCoord = PixelPos / 8u;
+	ComputeCMaskIndexAndShift(TileCoord, Index, Shift);
+
+	uint SubTileIndex = ((PixelPos.y & 4) >> 1) + ((PixelPos.x & 4) >> 2);	// Linear layout
+	
+	const uint SubTileOrder = GetSubTileOrder();
+	if (SubTileOrder != 0u)
+	{
+		// Remap to the target CMASK subtile mode (may not be TL, TR, BL, BR)
+		SubTileIndex = BitFieldExtractU32(SubTileOrder, 4, SubTileIndex * 4);
+	}
+
+	const uint BitOffset = (Index & 0x3) * 8u;
+	const uint SubTileMask = (OutCMaskBuffer.Load(Index) >> (Shift + BitOffset)) & 0xFu;
+	const bool bClearTile = (SubTileMask & (1u << SubTileIndex)) == 0u;
+
+	// We want to accumulate a heat map across multiple MRTs showing how many clears occur for a given tile region
+	uint OriginalValue = OutVisualized[PixelPos];
+
+	BRANCH
+	if (bClearTile)
+	{
+		OutVisualized[PixelPos] = OriginalValue + 1u;
+	}
+#endif
+}

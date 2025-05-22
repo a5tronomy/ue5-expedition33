@@ -1,0 +1,23 @@
+{
+	"FileVersion": 1,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Chaos Cloth Editor",
+	"Description": "Deprecated plugin, please use the Chaos Cloth plugin instead.",
+	"Category": "Physics",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EnabledByDefault": false,
+	"CanContainContent": true,
+	"Installed": false,
+	"Modules": [],
+	"Plugins": [
+		{
+			"Name": "ChaosCloth",
+			"Enabled": true
+		}
+	]
+}

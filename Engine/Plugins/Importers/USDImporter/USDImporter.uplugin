@@ -1,0 +1,168 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "USD Importer",
+	"Description": "Adds support for importing the USD file format into Unreal Engine",
+	"Category": "Importers",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EnabledByDefault": false,
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "UnrealUSDWrapper",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDUtilities",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDSchemas",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDStage",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDStageEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDStageImporter",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDStageEditorViewModels",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDExporter",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDClasses",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+        {
+			"Name": "USDClassesEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "GeometryCacheUSD",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		},
+		{
+			"Name": "USDTests",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64", "Mac", "Linux"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "AnalyticsBlueprintLibrary",
+			"Enabled": true
+		},
+		{
+			"Name": "ControlRig",
+			"Enabled": true
+		},
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		},
+		{
+			"Name": "GeometryCache",
+			"Enabled": true
+		},
+		{
+			"Name": "Interchange",
+			"Enabled": true,
+			"PlatformAllowList": [
+				"Win64",
+				"Mac",
+				"Linux"
+			]
+		},
+		{
+			"Name": "LevelSequenceEditor",
+			"Enabled": true
+		},
+		{
+			"Name": "LiveLink",
+			"Enabled": true
+		},
+		{
+			"Name": "MDLImporter",
+			"Enabled": true,
+			"PlatformAllowList": [
+				"Win64",
+				"Mac",
+				"Linux"
+			]
+		},
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "SequencerScripting",
+			"Enabled": true
+		},
+		{
+			"Name": "HairStrands",
+			"Enabled": true
+		}
+	]
+}

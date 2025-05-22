@@ -1,0 +1,12 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	GLCommon.ush: Common GL shader code
+=============================================================================*/
+
+#pragma once
+
+// Update this GUID to invalidate shader recompilation for only GL shaders
+#pragma message("UESHADERMETADATA_VERSION 3FB1EB49-0442-40E1-9F1B-0371F7ABB4BB")
+
+

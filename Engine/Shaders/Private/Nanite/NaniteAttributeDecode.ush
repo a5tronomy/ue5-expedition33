@@ -1,0 +1,916 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "NaniteDataDecode.ush"
+#include "../Barycentrics.ush"
+
+struct FNaniteAttributeData
+{
+	/** Interpolated vertex color, in linear color space. */
+	TDual< half4 >	VertexColor;
+	TDual< float2 >	TexCoords[NANITE_MAX_UVS];
+
+	/** Orthonormal rotation-only transform from tangent space to world space. */
+	half3x3 TangentToWorld;
+
+	half UnMirrored;
+};
+
+struct FNaniteRawAttributeData
+{
+	float4 TangentX_AndSign;
+	float3 TangentZ;
+	float4 Color;
+	float2 TexCoords[NANITE_MAX_UVS];
+};
+
+HLSL_STATIC_ASSERT(sizeof(FNaniteRawAttributeData) == 44 + 8 * NANITE_MAX_UVS, "Unexpected size of FNaniteRawAttributeData. Update StoreVertexToLDS to reflect changes.");
+FNaniteRawAttributeData WaveReadLaneAt(FNaniteRawAttributeData In, uint SrcIndex)
+{
+	FNaniteRawAttributeData Out;
+	Out.TangentX_AndSign = WaveReadLaneAt(In.TangentX_AndSign, SrcIndex);
+	Out.TangentZ = WaveReadLaneAt(In.TangentZ, SrcIndex);
+	Out.Color = WaveReadLaneAt(In.Color, SrcIndex);
+	UNROLL
+	for (uint i = 0; i < NANITE_MAX_UVS; ++i)
+	{
+		Out.TexCoords[i] = WaveReadLaneAt(In.TexCoords[i], SrcIndex);
+	}
+	return Out;
+}
+
+#define SIZEOF_PACKED_UV_RANGE	8
+struct FUVRange
+{
+	uint2	Min;
+	uint2	NumBits;
+	uint	NumMantissaBits;
+};
+
+
+FUVRange UnpackUVRange(uint2 Data)
+{
+	FUVRange Range;
+
+	Range.NumBits.x			= BitFieldExtractU32(Data.x, 5, 0);
+	Range.Min.x				= Data.x >> 5;
+	
+	Range.NumBits.y			= BitFieldExtractU32(Data.y, 5, 0);
+	Range.Min.y				= Data.y >> 5;
+	
+	Range.NumMantissaBits	= NANITE_UV_FLOAT_NUM_MANTISSA_BITS;	// Hardcode for now, but eventually make this a mesh setting.
+
+	return Range;
+}
+
+FUVRange GetUVRange(ByteAddressBuffer InputBuffer, uint StartOffset, uint Index)
+{
+	uint2 Data = InputBuffer.Load2(StartOffset + Index * SIZEOF_PACKED_UV_RANGE);
+	return UnpackUVRange(Data);
+}
+
+FUVRange GetUVRange(RWByteAddressBuffer InputBuffer, uint StartOffset, uint Index)
+{
+	uint2 Data = InputBuffer.Load2(StartOffset + Index * SIZEOF_PACKED_UV_RANGE);
+	return UnpackUVRange(Data);
+}
+
+float DecodeUVFloat(uint EncodedValue, uint NumMantissaBits)
+{
+	const uint ExponentAndMantissaMask	= BitFieldMaskU32(NANITE_UV_FLOAT_NUM_EXPONENT_BITS + NumMantissaBits, 0);
+	const bool bNeg						= (EncodedValue <= ExponentAndMantissaMask);
+	const uint ExponentAndMantissa		= (bNeg ? ~EncodedValue : EncodedValue) & ExponentAndMantissaMask;
+
+	float Result	= asfloat(0x3F000000u + (ExponentAndMantissa << (23 - NumMantissaBits)));
+	Result			= min(Result * 2.0f - 1.0f, Result);		// Stretch denormals from [0.5,1.0] to [0.0,1.0]
+
+	return bNeg ? -Result : Result;
+}
+
+float2 UnpackTexCoord(uint2 Packed, FUVRange UVRange)
+{
+	const uint2 GlobalUV = UVRange.Min + Packed;
+
+	return float2(	DecodeUVFloat(GlobalUV.x, UVRange.NumMantissaBits),
+					DecodeUVFloat(GlobalUV.y, UVRange.NumMantissaBits));
+}
+
+float3 UnpackNormal(uint Packed, uint Bits)
+{
+	uint Mask = BitFieldMaskU32(Bits, 0);
+	float2 F = uint2(BitFieldExtractU32(Packed, Bits, 0), BitFieldExtractU32(Packed, Bits, Bits)) * (2.0f / Mask) - 1.0f;
+	float3 N = float3(F.xy, 1.0 - abs(F.x) - abs(F.y));
+	float T = saturate(-N.z);
+	N.xy += select(N.xy >= 0.0, -T, T);
+	return normalize(N);
+}
+
+uint CalculateMaxAttributeBits(uint NumTexCoordInterpolators)
+{
+	uint Size = 0u;
+	Size += 2u * NANITE_MAX_NORMAL_QUANTIZATION_BITS;
+	Size += 1u + NANITE_MAX_TANGENT_QUANTIZATION_BITS;
+	Size += 4u * NANITE_MAX_COLOR_QUANTIZATION_BITS;
+	Size += NumTexCoordInterpolators * (2u * NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+	return Size;
+}
+
+void DecodeMaterialRange(uint EncodedRange, out uint TriStart, out uint TriLength, out uint MaterialIndex)
+{
+	// uint32 TriStart      :  8; // max 128 triangles
+	// uint32 TriLength     :  8; // max 128 triangles
+	// uint32 MaterialIndex :  6; // max  64 materials
+	// uint32 Padding       : 10;
+
+	TriStart = BitFieldExtractU32(EncodedRange, 8, 0);
+	TriLength = BitFieldExtractU32(EncodedRange, 8, 8);
+	MaterialIndex = BitFieldExtractU32(EncodedRange, 6, 16);
+}
+
+bool IsMaterialFastPath(FCluster InCluster)
+{
+	return (InCluster.Material0Length > 0);
+}
+
+uint GetMaterialCount(FCluster InCluster)
+{
+	if (IsMaterialFastPath(InCluster))
+	{
+		const uint Material2Length = InCluster.NumTris - InCluster.Material0Length - InCluster.Material1Length;
+		return 1 + (InCluster.Material1Length > 0) + (Material2Length > 0);
+	}
+	else
+	{
+		return InCluster.MaterialTableLength;
+	}
+}
+
+uint GetRelativeMaterialIndex(FCluster InCluster, uint InTriIndex)
+{
+	uint MaterialIndex = 0xFFFFFFFF;
+
+	BRANCH
+	if (IsMaterialFastPath(InCluster))
+	{
+		if (InTriIndex < InCluster.Material0Length)
+		{
+			MaterialIndex = InCluster.Material0Index;
+		}
+		else if (InTriIndex < (InCluster.Material0Length + InCluster.Material1Length))
+		{
+			MaterialIndex = InCluster.Material1Index;
+		}
+		else
+		{
+			MaterialIndex = InCluster.Material2Index;
+		}
+	}
+	else
+	{
+		uint TableOffset = InCluster.PageBaseAddress + InCluster.MaterialTableOffset * 4;
+		LOOP for (uint TableEntry = 0; TableEntry < InCluster.MaterialTableLength; ++TableEntry)
+		{
+			uint EncodedRange = ClusterPageData.Load(TableOffset);
+			TableOffset += 4;
+
+			uint TriStart;
+			uint TriLength;
+			uint TriMaterialIndex;
+			DecodeMaterialRange(EncodedRange, TriStart, TriLength, TriMaterialIndex);
+
+			if (InTriIndex >= TriStart && InTriIndex < (TriStart + TriLength))
+			{
+				MaterialIndex = TriMaterialIndex;
+				break;
+			}
+		}
+	}
+
+	return MaterialIndex;
+}
+
+struct FNaniteMaterialPrimitiveData
+{
+	uint MaterialBufferOffset;
+	uint MaterialMaxIndex;
+	uint MeshPassMask;
+	bool bHasUVDensities;
+	uint HitProxyBufferOffset;
+};
+
+FNaniteMaterialPrimitiveData UnpackNaniteMaterialPrimitiveData(uint3 Data)
+{
+	FNaniteMaterialPrimitiveData Output;
+	Output.MaterialBufferOffset	= Data.x;
+	Output.MaterialMaxIndex		= BitFieldExtractU32(Data.y, 8u,  0u);
+	Output.MeshPassMask			= BitFieldExtractU32(Data.y, 8u,  8u);
+	Output.bHasUVDensities		= BitFieldExtractU32(Data.y, 1u, 16u);
+	Output.HitProxyBufferOffset = Data.z;
+
+	return Output;
+}
+
+FNaniteMaterialPrimitiveData LoadNaniteMaterialPrimitiveData(uint InPrimitiveIndex)
+{
+	const uint ElementStride = Scene.NaniteMaterials.PrimitiveMaterialElementStride;
+	const uint Offset = InPrimitiveIndex * ElementStride;
+	uint3 Data = (uint3)0xFFFFFFFFu;
+	
+#if USE_EDITOR_SHADERS
+	// Check to load the hit proxy buffer offset
+	if (ElementStride / 4u >= 3u)
+	{
+		Data = Scene.NaniteMaterials.PrimitiveMaterialData.Load3(Offset);
+	}
+	else
+#endif
+	{
+		checkSlow(ElementStride / 4u >= 2u);
+		Data.xy = Scene.NaniteMaterials.PrimitiveMaterialData.Load2(InPrimitiveIndex * 2u * 4u);
+	}
+	return UnpackNaniteMaterialPrimitiveData(Data);
+}
+
+struct FNaniteMaterialSlot
+{
+	uint ShadingBin;
+	uint RasterBin;
+	uint SecondaryRasterBin;
+	uint LegacyShadingId;
+};
+
+FNaniteMaterialSlot UnpackMaterialSlot(uint2 Data)
+{
+	FNaniteMaterialSlot Output;
+	Output.ShadingBin			= Data.x >> 16u;
+	Output.RasterBin			= Data.x & 0xFFFFu;
+	Output.LegacyShadingId		= Data.y >> 16u;
+	Output.SecondaryRasterBin	= Data.y & 0xFFFFu;
+	return Output;
+}
+
+FNaniteMaterialSlot LoadMaterialSlot(uint Offset)
+{
+	uint2 Data = Scene.NaniteMaterials.MaterialData.Load2(Offset);
+	return UnpackMaterialSlot(Data);
+}
+
+float4 LoadMaterialUVDensities(uint Offset)
+{
+	if (Offset == 0xFFFFFFFFu)
+	{
+		return (float4)1.0f;
+	}
+	return asfloat(Scene.NaniteMaterials.MaterialData.Load4(Offset));
+}
+
+uint GetMaterialSlotOffset(uint InRelativeMaterialIndex, uint InPrimitiveIndex, uint InMeshPassIndex)
+{
+	FNaniteMaterialPrimitiveData PrimitiveData = LoadNaniteMaterialPrimitiveData(InPrimitiveIndex);
+	const uint DwordsPerMaterialSlot = 2u;
+	const uint MeshPassBit = (1u << InMeshPassIndex);
+	const uint MaterialCount = PrimitiveData.MaterialMaxIndex + 1;
+	const uint MeshPassSlotsOffset = MaterialCount * countbits(PrimitiveData.MeshPassMask & (MeshPassBit - 1u));
+
+	checkSlow(PrimitiveData.MaterialBufferOffset != 0xFFFFFFFFu);
+	checkSlow((MeshPassBit & PrimitiveData.MeshPassMask) != 0);
+
+	InRelativeMaterialIndex = min(InRelativeMaterialIndex, PrimitiveData.MaterialMaxIndex);
+
+	return 4 * (
+		PrimitiveData.MaterialBufferOffset +
+		DwordsPerMaterialSlot * (MeshPassSlotsOffset + InRelativeMaterialIndex)
+	);
+}
+
+uint GetMaterialUVDensitiesOffset(uint InRelativeMaterialIndex, uint InPrimitiveIndex)
+{
+	FNaniteMaterialPrimitiveData PrimitiveData = LoadNaniteMaterialPrimitiveData(InPrimitiveIndex);
+	
+	checkSlow(PrimitiveData.MaterialBufferOffset != 0xFFFFFFFFu);
+
+	if (!PrimitiveData.bHasUVDensities)
+	{
+		return 0xFFFFFFFFu;
+	}
+
+	const uint DwordsPerMaterialSlot = 2u;
+	const uint DwordsPerUVDensities = 4u;
+	const uint MaterialCount = PrimitiveData.MaterialMaxIndex + 1;
+	const uint FirstUVDensitiesOffset = MaterialCount * countbits(PrimitiveData.MeshPassMask) * DwordsPerMaterialSlot;
+
+	InRelativeMaterialIndex = min(InRelativeMaterialIndex, PrimitiveData.MaterialMaxIndex);
+
+	return 4 * (
+		PrimitiveData.MaterialBufferOffset +
+		FirstUVDensitiesOffset +
+		(InRelativeMaterialIndex * DwordsPerUVDensities)
+	);
+}
+
+FNaniteMaterialSlot LoadMaterialSlot(uint InRelativeMaterialIndex, uint InPrimitiveIndex, uint InMeshPassIndex)
+{
+	return LoadMaterialSlot(GetMaterialSlotOffset(InRelativeMaterialIndex, InPrimitiveIndex, InMeshPassIndex));
+}
+
+float4 LoadMaterialUVDensities(uint InRelativeMaterialIndex, uint InPrimitiveIndex)
+{
+	return LoadMaterialUVDensities(GetMaterialUVDensitiesOffset(InRelativeMaterialIndex, InPrimitiveIndex));
+}
+
+uint GetMaterialLegacyShadingIdFromIndex(
+	uint InRelativeMaterialIndex,
+	uint InPrimitiveIndex,
+	uint InMeshPassIndex)
+{
+	FNaniteMaterialSlot MaterialSlot = LoadMaterialSlot(InRelativeMaterialIndex, InPrimitiveIndex, InMeshPassIndex);
+	return MaterialSlot.LegacyShadingId;
+}
+
+uint GetMaterialShadingBinFromIndex(
+	uint InRelativeMaterialIndex,
+	uint InPrimitiveIndex,
+	uint InMeshPassIndex)
+{
+	FNaniteMaterialSlot MaterialSlot = LoadMaterialSlot(InRelativeMaterialIndex, InPrimitiveIndex, InMeshPassIndex);
+	return MaterialSlot.ShadingBin;
+}
+
+uint RemapRasterBin(uint InBinIndex, uint InRenderFlags, FNaniteMaterialFlags MaterialFlags)
+{
+	uint RemappedBin = InBinIndex;
+
+	if ((InRenderFlags & NANITE_RENDER_FLAG_DISABLE_PROGRAMMABLE) != 0)
+	{
+		RemappedBin  = NANITE_FIXED_FUNCTION_BIN;
+		RemappedBin |= select(MaterialFlags.bTwoSided, NANITE_FIXED_FUNCTION_BIN_TWOSIDED, 0x0u);
+		RemappedBin |= select(MaterialFlags.bSplineMesh, NANITE_FIXED_FUNCTION_BIN_SPLINE, 0x0u);
+	}
+
+	return RemappedBin;
+}
+
+uint GetMaterialRasterBinFromIndex(
+	uint InRelativeMaterialIndex,
+	uint InPrimitiveIndex,
+	uint InMeshPassIndex,
+	uint InRegularRasterBinCount,
+	bool bSecondaryRasterBin)
+{
+	FNaniteMaterialSlot MaterialSlot = LoadMaterialSlot(InRelativeMaterialIndex, InPrimitiveIndex, InMeshPassIndex);
+	uint RasterBin = MaterialSlot.RasterBin;
+	
+	if (bSecondaryRasterBin && MaterialSlot.SecondaryRasterBin != 0xFFFFu)
+	{
+		RasterBin = MaterialSlot.SecondaryRasterBin;
+	}
+
+	if (RasterBin >= InRegularRasterBinCount)
+	{
+		RasterBin = 0xFFFFu - RasterBin + InRegularRasterBinCount;
+	}
+
+	return RasterBin;
+}
+
+uint GetMaterialLegacyShadingId(
+	FCluster InCluster,
+	uint InPrimitiveIndex,
+	uint InMeshPassIndex,
+	uint InTriIndex)
+{
+	const uint RelativeMaterialIndex = GetRelativeMaterialIndex(InCluster, InTriIndex);
+	return GetMaterialLegacyShadingIdFromIndex(RelativeMaterialIndex, InPrimitiveIndex, InMeshPassIndex);
+}
+
+float4 GetMaterialUVDensities(
+	FCluster InCluster,
+	uint InPrimitiveIndex,
+	uint InTriIndex)
+{
+	const uint RelativeMaterialIndex = GetRelativeMaterialIndex(InCluster, InTriIndex);
+	return LoadMaterialUVDensities(RelativeMaterialIndex, InPrimitiveIndex);
+}
+
+uint GetMaterialShadingBin(
+	FCluster InCluster,	
+	uint InPrimitiveIndex,
+	uint InMeshPassIndex,
+	uint InTriIndex)
+{
+	const uint RelativeMaterialIndex = GetRelativeMaterialIndex(InCluster, InTriIndex);
+	return GetMaterialShadingBinFromIndex(RelativeMaterialIndex, InPrimitiveIndex, InMeshPassIndex);
+}
+
+uint GetMaterialRasterBin(
+	FCluster InCluster,
+	uint InPrimitiveIndex,
+	uint InMeshPassIndex,
+	uint InTriIndex,
+	uint InRegularSlotCount,
+	bool bSecondaryBin)
+{
+	return GetMaterialRasterBinFromIndex(
+		GetRelativeMaterialIndex(InCluster, InTriIndex),
+		InPrimitiveIndex,
+		InMeshPassIndex,
+		InRegularSlotCount,
+		bSecondaryBin
+	);
+}
+
+uint GetMaterialDepthId(
+	uint InMaterialSlot,
+	ByteAddressBuffer InMaterialDepthTable)
+{
+	const uint MaterialDepthId = InMaterialDepthTable.Load(InMaterialSlot * 4);
+	return MaterialDepthId;
+}
+
+uint LoadMaterialHitProxyId(uint InPrimitiveIndex, uint InMaterialIndex, ByteAddressBuffer InMaterialHitProxyTable)
+{
+	FNaniteMaterialPrimitiveData PrimitiveData = LoadNaniteMaterialPrimitiveData(InPrimitiveIndex);
+	const uint InvisibleHitProxyID = uint(-2);
+	uint HitProxyID = InvisibleHitProxyID;
+	if (PrimitiveData.HitProxyBufferOffset != 0xFFFFFFFFu)
+	{
+		const uint OffsetDwords = PrimitiveData.HitProxyBufferOffset + min(InMaterialIndex, PrimitiveData.MaterialMaxIndex);
+		HitProxyID = InMaterialHitProxyTable.Load(OffsetDwords * 4);
+	}
+	return HitProxyID;
+}
+
+uint GetMaterialHitProxyId(
+	FCluster InCluster,
+	uint InPrimitiveIndex,
+	uint InTriIndex,
+	ByteAddressBuffer InMaterialHitProxyTable)
+{
+	const uint RelativeMaterialIndex = GetRelativeMaterialIndex(InCluster, InTriIndex);
+	const uint MaterialHitProxyId = LoadMaterialHitProxyId(InPrimitiveIndex, RelativeMaterialIndex, InMaterialHitProxyTable);
+	return MaterialHitProxyId;
+}
+
+uint GetMaterialBucketIdFromDepth(float Depth)
+{
+	return (uint)(Depth * NANITE_MAX_STATE_BUCKET_ID);
+}
+
+float3 UnpackTangentX(float3 TangentZ, uint TangentAngleBits, uint NumTangentBits)
+{
+	const bool bSwapXZ = (abs(TangentZ.z) > abs(TangentZ.x));
+	if (bSwapXZ) TangentZ.xz = TangentZ.zx;
+
+	const float3 TangentRefX = float3(-TangentZ.y, TangentZ.x, 0.0f);
+	const float3 TangentRefY = cross(TangentZ, TangentRefX);
+
+	const float Scale = rsqrt(dot(TangentRefX.xy, TangentRefX.xy));
+	
+	const float TangentAngle = float(TangentAngleBits) * ((2.0f * PI) / (1u << NumTangentBits));
+	float3 TangentX = TangentRefX * (cos(TangentAngle) * Scale) + TangentRefY * (sin(TangentAngle) * Scale);
+	if (bSwapXZ) TangentX.xz = TangentX.zx;
+	return TangentX;
+}
+
+
+// Decodes vertex attributes for N vertices. N must be compile-time constant and <= 3.
+// Decoding multiple vertices from the same cluster simultaneously tends to generate better code than decoding them individually.
+void GetRawAttributeDataN(inout FNaniteRawAttributeData RawAttributeData[3],
+	FCluster Cluster,
+	uint3 TriIndices,
+	uint CompileTimeN,
+	uint CompileTimeMaxTexCoords
+)
+{
+	// Always process first UV set. Even if it isn't used, we might still need TangentToWorld.
+	CompileTimeMaxTexCoords = max(1, min(NANITE_MAX_UVS, CompileTimeMaxTexCoords));
+
+	const uint DecodeInfoOffset = Cluster.PageBaseAddress + Cluster.DecodeInfoOffset;
+	const uint AttributeDataOffset = Cluster.PageBaseAddress + Cluster.AttributeOffset;
+
+	float2 TexCoords[NANITE_MAX_UVS];
+	uint i;
+	UNROLL
+	for (i = 0; i < CompileTimeN; i++)
+	{
+		RawAttributeData[i] = (FNaniteRawAttributeData)0;
+		TexCoords[i] = 0.0f;
+	}
+
+#if NANITE_USE_UNCOMPRESSED_VERTEX_DATA
+	uint3 ReadOffset = AttributeDataOffset + TriIndices * Cluster.BitsPerAttribute / 8;
+	UNROLL
+	for(i = 0; i < CompileTimeN; i++)
+	{
+		RawAttributeData[i].TangentZ = asfloat(ClusterPageData.Load3(ReadOffset[i]));
+		ReadOffset[i] += 12;
+		if(Cluster.bHasTangents)
+		{
+			RawAttributeData[i].TangentX_AndSign = asfloat(ClusterPageData.Load4(ReadOffset[i]));
+			ReadOffset[i] += 16;
+		}
+		RawAttributeData[i].Color = float4(UnpackToUint4(ClusterPageData.Load(ReadOffset[i]), 8)) * (1.0f / 255.0f);
+		ReadOffset[i] += 4;
+	}
+
+	UNROLL
+	for (uint TexCoordIndex = 0; TexCoordIndex < CompileTimeMaxTexCoords; TexCoordIndex++)
+	{
+		if(TexCoordIndex < Cluster.NumUVs)
+		{
+			UNROLL
+			for (uint i = 0; i < CompileTimeN; i++)
+			{
+				TexCoords[i] = asfloat(ClusterPageData.Load2(ReadOffset[i]));
+			}
+			ReadOffset += 8;
+		}
+
+		UNROLL
+		for (uint i = 0; i < CompileTimeN; i++)
+		{
+			RawAttributeData[i].TexCoords[TexCoordIndex] = TexCoords[i];
+		}
+	}
+#else
+	const uint CompileTimeMaxAttributeBits = CalculateMaxAttributeBits(CompileTimeMaxTexCoords);
+
+	// Watch out! Make sure control flow around BitStreamReader is always compile-time constant or codegen degrades significantly
+
+	uint4 ColorMin = uint4(UnpackByte0(Cluster.ColorMin), UnpackByte1(Cluster.ColorMin), UnpackByte2(Cluster.ColorMin), UnpackByte3(Cluster.ColorMin));
+	const uint4 NumComponentBits = UnpackToUint4(Cluster.ColorBits, 4);
+
+	FBitStreamReaderState AttributeStream[3];
+	UNROLL
+	for (i = 0; i < CompileTimeN; i++)
+	{
+		AttributeStream[i] = BitStreamReader_Create_Aligned(AttributeDataOffset, TriIndices[i] * Cluster.BitsPerAttribute, CompileTimeMaxAttributeBits);
+
+		const uint NormalBits = BitStreamReader_Read_RO(ClusterPageData, AttributeStream[i], 2 * Cluster.NormalPrecision, 2 * NANITE_MAX_NORMAL_QUANTIZATION_BITS);
+		const float3 TangentZ = UnpackNormal(NormalBits, Cluster.NormalPrecision);
+		RawAttributeData[i].TangentZ = TangentZ;
+
+		const uint NumTangentBits = Cluster.bHasTangents ? (Cluster.TangentPrecision + 1) : 0u;
+		const uint TangentAngleAndSignBits = BitStreamReader_Read_RO(ClusterPageData, AttributeStream[i], NumTangentBits, NANITE_MAX_TANGENT_QUANTIZATION_BITS + 1);
+	
+		BRANCH
+		if (Cluster.bHasTangents)
+		{
+			const bool bTangentYSign = (TangentAngleAndSignBits & (1u << Cluster.TangentPrecision)) != 0;
+			const uint TangentAngleBits = BitFieldExtractU32(TangentAngleAndSignBits, Cluster.TangentPrecision, 0);
+			RawAttributeData[i].TangentX_AndSign = float4(UnpackTangentX(TangentZ, TangentAngleBits, Cluster.TangentPrecision), bTangentYSign ? -1.0f : 1.0f);
+		}
+		else
+		{
+			RawAttributeData[i].TangentX_AndSign = 0.0f;
+		}
+
+		const uint4 ColorDelta = BitStreamReader_Read4_RO(ClusterPageData, AttributeStream[i], NumComponentBits, NANITE_MAX_COLOR_QUANTIZATION_BITS);
+		RawAttributeData[i].Color = float4(ColorMin + ColorDelta) * (1.0f / 255.0f);
+	}
+
+	UNROLL
+	for (uint TexCoordIndex = 0; TexCoordIndex < CompileTimeMaxTexCoords; ++TexCoordIndex)
+	{
+		uint2 UVRangeData = 0u;
+		if (TexCoordIndex < Cluster.NumUVs)
+		{
+			UVRangeData = ClusterPageData.Load2(DecodeInfoOffset + TexCoordIndex * SIZEOF_PACKED_UV_RANGE);
+		}
+
+		const FUVRange UVRange = UnpackUVRange(UVRangeData);
+		
+		uint2 UVBits[3];
+		UNROLL
+		for (uint i = 0; i < CompileTimeN; i++)
+		{
+			UVBits[i] = BitStreamReader_Read2_RO(ClusterPageData, AttributeStream[i], UVRange.NumBits, NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+		}
+
+		BRANCH
+		if (TexCoordIndex < Cluster.NumUVs)
+		{
+			UNROLL
+			for (uint i = 0; i < CompileTimeN; i++)
+			{
+				TexCoords[i] = UnpackTexCoord(UVBits[i], UVRange);
+			}
+		}
+
+		UNROLL
+		for (uint j = 0; j < CompileTimeN; j++)
+		{
+			RawAttributeData[j].TexCoords[TexCoordIndex] = TexCoords[j];
+		}
+	}
+#endif
+}
+
+void GetRawAttributeData3(inout FNaniteRawAttributeData RawAttributeData[3],
+	FCluster Cluster,
+	uint3 VertexIndices,
+	uint CompileTimeMaxTexCoords
+	)
+{
+	GetRawAttributeDataN(RawAttributeData, Cluster, VertexIndices, 3, CompileTimeMaxTexCoords);
+}
+
+FNaniteRawAttributeData GetRawAttributeData(
+	FCluster Cluster,
+	uint VertexIndex,
+	uint CompileTimeMaxTexCoords
+	)
+{
+	FNaniteRawAttributeData RawAttributeData[3];
+	GetRawAttributeDataN(RawAttributeData, Cluster, VertexIndex, 1, CompileTimeMaxTexCoords);
+	return RawAttributeData[0];
+}
+
+half3x3 NaniteTangentToLocal(float4 TangentX_AndSign, float3 UnnormalizedTangentZ)
+{
+	const float3 TangentY = cross(UnnormalizedTangentZ.xyz, TangentX_AndSign.xyz) * TangentX_AndSign.w;
+	return float3x3(TangentX_AndSign.xyz, TangentY, UnnormalizedTangentZ);
+}
+
+FNaniteAttributeData GetAttributeData(
+	FCluster Cluster,
+	float3 PointLocal0,
+	float3 PointLocal1,
+	float3 PointLocal2,
+	FNaniteRawAttributeData RawAttributeData0,
+	FNaniteRawAttributeData RawAttributeData1,
+	FNaniteRawAttributeData RawAttributeData2,
+	FBarycentrics Barycentrics,
+	FInstanceSceneData InstanceData,
+	uint CompileTimeMaxTexCoords,
+	half3x3 TangentRot
+)
+{
+	FNaniteAttributeData AttributeData = (FNaniteAttributeData)0;
+
+	// Always process first UV set. Even if it isn't used, we might still need TangentToWorld.
+	CompileTimeMaxTexCoords = max(1, min(NANITE_MAX_UVS, CompileTimeMaxTexCoords));
+
+	const float3 UnnormalizedTangentZ = Lerp( RawAttributeData0.TangentZ, RawAttributeData1.TangentZ, RawAttributeData2.TangentZ, Barycentrics ).Value;
+	const float3 TangentZ = normalize(UnnormalizedTangentZ);
+
+	// Decode vertex color
+	// This needs to happen even if INTERPOLATE_VERTEX_COLOR is not defined as the data might be there regardless of what the shader needs.
+	// When INTERPOLATE_VERTEX_COLOR is not defined, the results are not used and the code mostly disappears.
+	AttributeData.UnMirrored = 1.0f;
+
+#if NANITE_USE_UNCOMPRESSED_VERTEX_DATA
+	AttributeData.VertexColor.Value = Lerp( RawAttributeData0.Color, RawAttributeData1.Color, RawAttributeData2.Color, Barycentrics ).Value;
+#else
+	AttributeData.VertexColor.Value = RawAttributeData0.Color;
+	
+	if (Cluster.ColorMode == NANITE_VERTEX_COLOR_MODE_VARIABLE)
+	{
+		AttributeData.VertexColor = Lerp( RawAttributeData0.Color, RawAttributeData1.Color, RawAttributeData2.Color, Barycentrics );
+	}
+#endif
+
+	TDual< float2 > TexCoord = (TDual< float2 >)0;
+
+	UNROLL
+	for (uint TexCoordIndex = 0; TexCoordIndex < CompileTimeMaxTexCoords; ++TexCoordIndex)
+	{
+		if (TexCoordIndex < Cluster.NumUVs)
+		{
+			TexCoord = Lerp( RawAttributeData0.TexCoords[TexCoordIndex], RawAttributeData1.TexCoords[TexCoordIndex], RawAttributeData2.TexCoords[TexCoordIndex], Barycentrics );
+			
+			// Generate tangent frame for UV0
+			if (TexCoordIndex == 0)
+			{
+				float3x3 TangentToLocal;
+
+				BRANCH
+				if (Cluster.bHasTangents)
+				{
+					float4 TangentX_AndSign = Lerp( RawAttributeData0.TangentX_AndSign, RawAttributeData1.TangentX_AndSign, RawAttributeData2.TangentX_AndSign, Barycentrics ).Value;
+					TangentToLocal = NaniteTangentToLocal(TangentX_AndSign, UnnormalizedTangentZ);
+					AttributeData.UnMirrored = TangentX_AndSign.w;
+				}
+				else
+				{
+					// Implicit tangent space
+					// Based on Christian Schüler's derivation: http://www.thetenthplanet.de/archives/1180
+					// The technique derives a tangent space from the interpolated normal and (position,uv) deltas in two not necessarily orthogonal directions.
+					// The described technique uses screen space derivatives as a way to obtain these direction deltas in a pixel shader,
+					// but as we have the triangle vertices explicitly available using the local space corner deltas directly is faster and more convenient.
+
+					float3 PointLocal10 = PointLocal1 - PointLocal0;
+					float3 PointLocal20 = PointLocal2 - PointLocal0;
+					float2 TexCoord10 = RawAttributeData1.TexCoords[0] - RawAttributeData0.TexCoords[0];
+					float2 TexCoord20 = RawAttributeData2.TexCoords[0] - RawAttributeData0.TexCoords[0];
+
+					bool TangentXValid = abs(TexCoord10.x) + abs(TexCoord20.x) > 1e-6;
+
+					float3 TangentX;
+					float3 TangentY;
+					BRANCH
+					if (TangentXValid)
+					{
+						float3 Perp2 = cross(TangentZ, PointLocal20);
+						float3 Perp1 = cross(PointLocal10, TangentZ);
+						float3 TangentU = Perp2 * TexCoord10.x + Perp1 * TexCoord20.x;
+						float3 TangentV = Perp2 * TexCoord10.y + Perp1 * TexCoord20.y;
+
+						TangentX = normalize(TangentU);
+						TangentY = cross(TangentZ, TangentX);
+
+						AttributeData.UnMirrored = dot(TangentV, TangentY) < 0.0f ? -1.0f : 1.0f;
+						TangentY *= AttributeData.UnMirrored;
+					}
+					else
+					{
+						const float Sign = TangentZ.z >= 0 ? 1 : -1;
+						const float a = -rcp( Sign + TangentZ.z );
+						const float b = TangentZ.x * TangentZ.y * a;
+	
+						TangentX = float3(1 + Sign * a * Pow2(TangentZ.x), Sign * b, -Sign * TangentZ.x);
+						TangentY = float3(b,  Sign + a * Pow2(TangentZ.y), -TangentZ.y);
+
+						AttributeData.UnMirrored = 1;
+					}
+
+					TangentToLocal = float3x3(TangentX, TangentY, TangentZ);
+				}
+				TangentToLocal = mul(TangentToLocal, TangentRot);
+
+				// Should be Pow2(InvScale) but that requires renormalization
+				float3x3 LocalToWorldNoScale = DFToFloat3x3(InstanceData.LocalToWorld);
+				float3 InvScale = InstanceData.InvNonUniformScale;
+				LocalToWorldNoScale[0] *= InvScale.x;
+				LocalToWorldNoScale[1] *= InvScale.y;
+				LocalToWorldNoScale[2] *= InvScale.z;
+				AttributeData.TangentToWorld = mul(TangentToLocal, LocalToWorldNoScale);
+			}
+		}
+		else
+		{
+			if (TexCoordIndex == 0)
+			{
+				AttributeData.TangentToWorld = float3x3(float3(0, 0, 0), float3(0, 0, 0), DFMultiplyVector(TangentZ * InstanceData.InvNonUniformScale.z, InstanceData.LocalToWorld));
+			}
+		}
+
+		AttributeData.TexCoords[TexCoordIndex] = TexCoord;
+	}
+
+	return AttributeData;
+}
+
+FNaniteAttributeData GetAttributeData(
+	FCluster Cluster,
+	float3 PointLocal0,
+	float3 PointLocal1,
+	float3 PointLocal2,
+	FNaniteRawAttributeData RawAttributeData0,
+	FNaniteRawAttributeData RawAttributeData1,
+	FNaniteRawAttributeData RawAttributeData2,
+	FBarycentrics Barycentrics,
+	FInstanceSceneData InstanceData,
+	uint CompileTimeMaxTexCoords
+)
+{
+	const half3x3 TangentRot =
+	{
+		1, 0, 0,
+		0, 1, 0,
+		0, 0, 1
+	};
+	return GetAttributeData(
+		Cluster,
+		PointLocal0,
+		PointLocal1,
+		PointLocal2,
+		RawAttributeData0,
+		RawAttributeData1,
+		RawAttributeData2,
+		Barycentrics,
+		InstanceData,
+		CompileTimeMaxTexCoords,
+		TangentRot
+	);
+}
+
+TDual< float2 > GetTexCoord(
+	FCluster Cluster,
+	uint3 TriIndices,
+	FBarycentrics Barycentrics,
+	uint TexCoordIndex
+)
+{
+	if (Cluster.NumUVs == 0)
+		return (TDual< float2 >)0;
+
+	TexCoordIndex = min(TexCoordIndex, Cluster.NumUVs - 1);
+
+	// Unpack and interpolate attributes
+	const uint DecodeInfoOffset = Cluster.PageBaseAddress + Cluster.DecodeInfoOffset;
+	const uint AttributeDataOffset = Cluster.PageBaseAddress + Cluster.AttributeOffset;
+
+#if NANITE_USE_UNCOMPRESSED_VERTEX_DATA
+	uint3 ReadOffset = AttributeDataOffset + TriIndices * Cluster.BitsPerAttribute / 8;
+	ReadOffset += 12 + 4 + TexCoordIndex * 8;	// Normal + Color + TexCoord
+#else
+	const uint4 NumColorComponentBits = UnpackToUint4(Cluster.ColorBits, 4);
+	
+	const uint UVBitOffset = ((Cluster.UVBitOffsets >> (TexCoordIndex * 8u)) & 0xFFu);
+	const uint BitOffset = 2 * Cluster.NormalPrecision + dot(NumColorComponentBits, 1u) + UVBitOffset;
+
+	FBitStreamReaderState AttributeStream0 = BitStreamReader_Create_Aligned(AttributeDataOffset, BitOffset + TriIndices.x * Cluster.BitsPerAttribute, 2 * NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+	FBitStreamReaderState AttributeStream1 = BitStreamReader_Create_Aligned(AttributeDataOffset, BitOffset + TriIndices.y * Cluster.BitsPerAttribute, 2 * NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+	FBitStreamReaderState AttributeStream2 = BitStreamReader_Create_Aligned(AttributeDataOffset, BitOffset + TriIndices.z * Cluster.BitsPerAttribute, 2 * NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+#endif
+
+#if NANITE_USE_UNCOMPRESSED_VERTEX_DATA
+	float2 TexCoord0 = asfloat(ClusterPageData.Load2(ReadOffset.x));
+	float2 TexCoord1 = asfloat(ClusterPageData.Load2(ReadOffset.y));
+	float2 TexCoord2 = asfloat(ClusterPageData.Load2(ReadOffset.z));
+#else
+	const FUVRange UVRange = GetUVRange(ClusterPageData, DecodeInfoOffset, TexCoordIndex);
+	uint2 UVBits0 = BitStreamReader_Read2_RO(ClusterPageData, AttributeStream0, UVRange.NumBits, NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+	uint2 UVBits1 = BitStreamReader_Read2_RO(ClusterPageData, AttributeStream1, UVRange.NumBits, NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+	uint2 UVBits2 = BitStreamReader_Read2_RO(ClusterPageData, AttributeStream2, UVRange.NumBits, NANITE_MAX_TEXCOORD_COMPONENT_BITS);
+
+	float2 TexCoord0 = UnpackTexCoord(UVBits0, UVRange);
+	float2 TexCoord1 = UnpackTexCoord(UVBits1, UVRange);
+	float2 TexCoord2 = UnpackTexCoord(UVBits2, UVRange);
+#endif
+
+	return Lerp( TexCoord0, TexCoord1, TexCoord2, Barycentrics );	
+}
+
+// TODO: Move to an appropriate common location outside of Nanite
+uint LowerBound(Buffer<uint> SearchBuffer, uint BufferCount, uint Key)
+{
+	uint Index = 0;
+	uint Width = BufferCount >> 1;
+	
+	UNROLL
+	while (Width > 0)
+	{
+		Index += (Key < SearchBuffer[Index + Width]) ? 0 : Width;
+		Width = Width >> 1;
+	}
+	
+	return Index;
+}
+
+// TODO: Move to an appropriate common location outside of Nanite
+bool BinarySearch(Buffer<uint> SearchBuffer, uint BufferCount, uint Key)
+{
+	uint Index = LowerBound(SearchBuffer, BufferCount, Key);
+	return SearchBuffer[Index] == Key;
+}
+
+#ifndef DEFINE_ITERATE_CLUSTER_SEGMENTS
+#	define DEFINE_ITERATE_CLUSTER_SEGMENTS (0)
+#endif
+
+// Need manually strip unused template functions here due to a compiler issue: https://github.com/microsoft/DirectXShaderCompiler/issues/4649
+#if DEFINE_ITERATE_CLUSTER_SEGMENTS
+
+template<class ClusterSegmentProcessor>
+void IterateClusterSegments(FCluster Cluster, ByteAddressBuffer InClusterPageData, inout ClusterSegmentProcessor Processor)
+{
+	BRANCH
+	if (IsMaterialFastPath(Cluster))
+	{
+		{
+			Processor.Process(0, Cluster.Material0Length, Cluster.Material0Index);
+		}
+
+		if (Cluster.Material1Length > 0)
+		{
+			Processor.Process(Cluster.Material0Length, Cluster.Material1Length, Cluster.Material1Index);
+		}
+
+		const uint Material2Length = Cluster.NumTris - Cluster.Material0Length - Cluster.Material1Length;
+		if (Material2Length > 0)
+		{
+			Processor.Process(Cluster.Material0Length + Cluster.Material1Length, Material2Length, Cluster.Material2Index);
+		}
+	}
+	else
+	{
+		uint TableOffset = Cluster.PageBaseAddress + Cluster.MaterialTableOffset * 4;
+		LOOP for (uint TableEntry = 0; TableEntry < Cluster.MaterialTableLength; ++TableEntry)
+		{
+			uint EncodedRange = InClusterPageData.Load(TableOffset);
+			TableOffset += 4;
+
+			uint TriStart;
+			uint TriLength;
+			uint MaterialIndex;
+			DecodeMaterialRange(EncodedRange, TriStart, TriLength, MaterialIndex);
+
+			Processor.Process(TriStart, TriLength, MaterialIndex);
+		}
+	}
+}
+
+#endif

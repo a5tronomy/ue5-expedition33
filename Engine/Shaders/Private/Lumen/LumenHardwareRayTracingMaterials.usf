@@ -1,0 +1,58 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Shared/RayTracingTypes.h"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/SceneData.ush"
+#include "/Engine/Private/RayTracing/RayTracingHitGroupCommon.ush"
+#include "/Engine/Private/Lumen/LumenHardwareRayTracingCommon.ush"
+#include "/Engine/Private/Lumen/LumenHardwareRayTracingPayloadCommon.ush"
+#include "/Engine/Private/Lumen/LumenHardwareRayTracingPlatformCommon.ush"
+
+RAY_TRACING_ENTRY_CLOSEST_HIT(LumenHardwareRayTracingMaterialCHS,
+	FLumenMinimalPayload, Payload,
+	FRayTracingIntersectionAttributes, Attributes)
+{
+	Payload.HitT = RayTCurrent();
+
+	const int Primitive = GetInstanceUserData();
+	const int PrimitiveInstanceIndex = InstanceIndex() - GetBaseInstanceIndex();
+	const uint GPUSceneInstanceIndex = GetGPUSceneInstanceIndex(Primitive, PrimitiveInstanceIndex);
+	Payload.SetGPUSceneInstanceIndex(GPUSceneInstanceIndex);
+
+	uint MaterialShaderIndex = GetHitGroupUserData() & LUMEN_MATERIAL_SHADER_INDEX_MASK;
+	Payload.SetMaterialShaderIndex(MaterialShaderIndex);
+
+	uint bIsTranslucent = (GetHitGroupUserData() >> 31) & 0x1;
+	Payload.SetIsTranslucent(bIsTranslucent);
+
+	uint bIsTwoSided = (GetHitGroupUserData() >> 30) & 0x1;
+	Payload.SetIsTwoSided(bIsTwoSided);
+
+	float3 WorldNormal = ComputeWorldNormal(PrimitiveIndex());
+	Payload.SetWorldNormal(WorldNormal);
+}
+
+RAY_TRACING_ENTRY_MISS(LumenHardwareRayTracingMaterialMS,
+	FLumenMinimalPayload, Payload)
+{
+	Payload.SetMiss();
+}
+
+RAY_TRACING_ENTRY_ANY_HIT(
+	LumenHardwareRayTracingMaterialAHS,
+	FLumenMinimalPayload,
+	Payload,
+	FRayTracingIntersectionAttributes,
+	Attributes)
+{
+	const bool bAcceptHit = LumenMinimalRayAnyHitShader(
+		GetHitGroupUserData(),
+		RayTCurrent(),
+		HitKind() == HIT_KIND_TRIANGLE_BACK_FACE,
+		Payload.IsShadowRay());
+
+	if (!bAcceptHit)
+	{
+		IgnoreHit();
+	}
+}

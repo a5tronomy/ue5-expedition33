@@ -1,0 +1,9 @@
+<component name="ProjectRunConfigurationManager">
+	<configuration default="false" name="app" type="AndroidRunConfigurationType" factoryName="Android App">
+		<module name="app.app.main" />
+		<option name="DEBUGGER_TYPE" value="Hybrid" />
+		<Hybrid>${IDEA_RUN_CONFIGURATION_SYMBOL_PATHS}
+			<startup_commands startup_commands_attr="command script import &quot;${PY_VISUALIZER_PATH}&quot;" />
+		</Hybrid>
+	</configuration>
+</component>

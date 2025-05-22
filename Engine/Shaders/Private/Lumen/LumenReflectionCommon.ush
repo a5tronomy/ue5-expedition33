@@ -1,0 +1,236 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../MonteCarlo.ush"
+#include "../BlueNoise.ush"
+#include "LumenPosition.ush"
+
+// Change this to force recompilation of all Lumen reflection shaders
+#pragma message("UESHADERMETADATA_VERSION B72EBD51-AD20-4353-B91A-4EE5FF02A797")
+
+#define REFLECTION_THREADGROUP_SIZE_2D 8 
+#define REFLECTION_THREADGROUP_SIZE_1D 64
+
+uint2 ReflectionTracingViewSize;
+uint2 ReflectionTracingBufferSize;
+
+// Downsample factor from full res to tracing res
+uint ReflectionDownsampleFactor;
+float MaxRayIntensity;
+float ReflectionSmoothBias;
+
+// 0: Opaque, 1: SingleLayerWater, 2: FrontLayerTranslucency
+uint ReflectionPass;
+uint UseJitter;
+uint UseHighResSurface;
+
+// Note: negative if invalid ray
+Texture2DArray DownsampledDepth;
+Texture2DArray<float4> RayBuffer;
+// The distance to trace each ray before interpolating from the Radiance Cache
+Texture2DArray<uint> RayTraceDistance;
+
+Texture2DArray<float3> TraceRadiance;
+Texture2DArray<float> TraceHit;
+
+uint ReflectionsStateFrameIndex;
+uint ReflectionsStateFrameIndexMod8;
+uint ReflectionsRayDirectionFrameIndex;
+
+// Returns the jitter offset in the range [0, ReflectionDownsampleFactor - 1]
+float2 GetScreenTileJitter()
+{
+	return 0;
+}
+
+float2 GetScreenUVFromReflectionTracingCoord(uint2 ReflectionTracingCoord)
+{
+	float2 ScreenCoord = ReflectionTracingCoord * ReflectionDownsampleFactor + View.ViewRectMin.xy + GetScreenTileJitter() + 0.5f;
+	// ScreenUV can be outside of valid viewport, since viewport is downsampled with DivideAndRoundUp
+	ScreenCoord = min(ScreenCoord, View.ViewRectMin.xy + View.ViewSizeAndInvSize.xy - 1.0f);
+	return ScreenCoord * View.BufferSizeAndInvSize.zw;
+}
+
+float GetMaxHitDistance()
+{
+	return MaxHalfFloat;
+}
+
+float EncodeRayDistance(float HitDistance, bool bHit)
+{
+	HitDistance = max(HitDistance, 0.0f);
+	return HitDistance * (bHit ? -1.0f : 1.0f);
+}
+
+float DecodeRayDistance(float Encoded, out bool bHit)
+{
+	bHit = asuint(Encoded) & 0x80000000;
+	return abs(Encoded);
+}
+
+float DecodeProbeRayDistance(float Encoded)
+{
+	return abs(Encoded);
+}
+
+struct FRayData
+{
+	float3 Direction;
+	float PDF;
+	float ConeHalfAngle;
+
+	// Radiance cache max trace distance. Don't need to load this data if radiance cache isn't used.
+	float RadianceCacheMaxTraceDistance;
+	bool bUseRadianceCache;
+};
+
+// Must be larger than FLOAT16_MIN
+const static float MinReflectionConeAngle = 0.00001f;
+
+uint PackRayTraceDistance(float RayTraceDistance, bool bUseRadianceCache)
+{
+	uint PackedData =
+		(f32tof16(min(RayTraceDistance, GetMaxHitDistance())) & 0x7FFF) |
+		(bUseRadianceCache << 15);
+	return PackedData;
+}
+
+void UnpackRayTraceDistance(uint PackedData, inout float RadianceCacheMaxTraceDistance, inout bool bUseRadianceCache)
+{
+	RadianceCacheMaxTraceDistance = f16tof32(PackedData & 0x7FFF);
+	bUseRadianceCache = (PackedData >> 15) != 0;
+}
+
+FRayData GetRayData(uint3 TracingCoord)
+{
+	float4 PackedRayData = RayBuffer[TracingCoord];
+
+	FRayData RayData;
+	RayData.Direction = PackedRayData.xyz;
+	RayData.ConeHalfAngle = PackedRayData.w;
+	RayData.PDF = 1.0f / PackedRayData.w;
+
+	UnpackRayTraceDistance(RayTraceDistance[TracingCoord], RayData.RadianceCacheMaxTraceDistance, RayData.bUseRadianceCache);
+
+	return RayData;
+}
+
+Buffer<uint> ReflectionResolveTileData;
+
+
+struct FReflectionTileData
+{
+	uint2 Coord;
+	uint ClosureIndex;
+};
+
+uint PackTileData(FReflectionTileData In)
+{
+	return 
+	#if SUBSTRATE_ENABLED
+		((In.ClosureIndex & 0x7) << 24) |
+	#endif
+		PackTileCoord12bits(In.Coord);
+}
+
+FReflectionTileData UnpackTileData(uint In)
+{
+	FReflectionTileData Out;
+	Out.Coord 	  = UnpackTileCoord12bits(In);
+	Out.ClosureIndex = SUBSTRATE_ENABLED ? ((In>>24) & 0x7) : 0;
+	return Out;
+}
+
+uint2 GetReflectionResolveScreenCoord(uint TileIndex, uint ThreadIndex, inout FReflectionTileData OutTileData)
+{
+	OutTileData = UnpackTileData(ReflectionResolveTileData[TileIndex]);
+	uint2 TileOffset = OutTileData.Coord;
+	return TileOffset * REFLECTION_THREADGROUP_SIZE_2D + uint2(ThreadIndex % REFLECTION_THREADGROUP_SIZE_2D, ThreadIndex / REFLECTION_THREADGROUP_SIZE_2D);
+}
+
+Buffer<uint> ReflectionTracingTileData;
+
+uint3 GetReflectionTracingScreenCoord(uint TileIndex, uint ThreadIndex, inout FReflectionTileData OutTileData)
+{
+	OutTileData = UnpackTileData(ReflectionTracingTileData[TileIndex]);
+	uint2 TileOffset = OutTileData.Coord;
+	return uint3(TileOffset * REFLECTION_THREADGROUP_SIZE_2D + uint2(ThreadIndex % REFLECTION_THREADGROUP_SIZE_2D, ThreadIndex / REFLECTION_THREADGROUP_SIZE_2D), OutTileData.ClosureIndex);
+}
+
+uint2 GetReflectionTracingScreenCoordZOrder(uint TileIndex, uint ThreadIndex, inout FReflectionTileData OutTileData)
+{
+	OutTileData = UnpackTileData(ReflectionTracingTileData[TileIndex]);
+	uint2 TileOffset = OutTileData.Coord;
+	return TileOffset * REFLECTION_THREADGROUP_SIZE_2D + ZOrder2D(ThreadIndex, log2(REFLECTION_THREADGROUP_SIZE_2D));
+}
+
+Buffer<uint> CompactedTraceTexelAllocator;
+Buffer<uint> CompactedTraceTexelData;
+
+struct FTraceMaterialId
+{
+	bool bNeedsHitLightingPass;
+	uint MaterialId;
+};
+
+uint PackTraceMaterialId(bool bNeedsHitLightingPass, uint MaterialShaderIndex)
+{
+	uint PackedMaterialId = MaterialShaderIndex & 0x7FFF;
+	PackedMaterialId |= bNeedsHitLightingPass ? 0x8000 : false;
+	return PackedMaterialId;
+}
+
+FTraceMaterialId UnpackTraceMaterialId(uint PackedMaterialId)
+{
+	FTraceMaterialId TraceMaterialId;
+	TraceMaterialId.bNeedsHitLightingPass = PackedMaterialId & 0x8000 ? true : false;
+	TraceMaterialId.MaterialId = PackedMaterialId & 0x7FFF;
+	return TraceMaterialId;
+}
+
+float ApplySmoothBias(float Roughness)
+{
+	float NewRoughness = Roughness;
+
+	if (ReflectionSmoothBias > 0)
+	{
+		// SmoothStep-like function up to SmoothBias, original value above
+		float X = saturate(Roughness / ReflectionSmoothBias);
+		NewRoughness = Roughness * X * X * (3.0 - 2.0 * X);
+	}
+
+	// Only opaque and translucent reflections get the denoiser, otherwise force to mirror
+	return ReflectionPass == 0 || ReflectionPass == 2 ? NewRoughness : 0.0f;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Abstract coord for reflection tracing
+
+struct FReflectionTracingCoord
+{
+	uint2 Coord;
+	uint3 CoordFlatten;
+	uint  ClosureIndex;
+};
+
+FReflectionTracingCoord GetReflectionTracingCoord(uint2 InReflectionTracingCoord, uint InClosureIndex)
+{
+	FReflectionTracingCoord Out;
+	Out.Coord = InReflectionTracingCoord;
+	Out.ClosureIndex = SUBSTRATE_ENABLED ? InClosureIndex : 0u;
+	Out.CoordFlatten = uint3(Out.Coord, Out.ClosureIndex);
+	return Out;
+}
+
+uint EncodeTraceTexel(uint2 ReflectionTracingCoord, uint InClosureIndex)
+{
+	return PackTileCoord12bits(ReflectionTracingCoord) | ((InClosureIndex & 0xF) << 24);
+}
+
+FReflectionTracingCoord DecodeTraceTexel(uint TraceTexelData)
+{
+	const uint2 TraceCoord = UnpackTileCoord12bits(TraceTexelData);
+	const uint ClosureIndex = (TraceTexelData >> 24) & 0xF;
+	return GetReflectionTracingCoord(TraceCoord, ClosureIndex);
+}

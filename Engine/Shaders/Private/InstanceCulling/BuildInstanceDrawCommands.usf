@@ -1,0 +1,360 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Just used to trigger shader recompiles, guid should be regenerated on merge conflicts
+#pragma message("UESHADERMETADATA_VERSION DC8F4920-57F0-41EF-ACC0-B6643D1D80C7")
+
+#ifndef ENABLE_PER_INSTANCE_CUSTOM_DATA
+	#define ENABLE_PER_INSTANCE_CUSTOM_DATA 1
+#endif
+
+#if ENABLE_INSTANCE_COMPACTION
+	// Currently, instance compaction is the only reason to need extended payload data, so tie it to the permutation for now.
+	#define ENABLE_EXTENDED_INSTANCE_CULLING_PAYLOADS 1
+#endif
+
+#ifndef INSTANCE_DATA_STRIDE_ELEMENTS
+	#define INSTANCE_DATA_STRIDE_ELEMENTS 1u
+#endif
+
+#ifndef VF_SUPPORTS_PRIMITIVE_SCENE_DATA
+	// Enable access to SceneData functionality for these compute shaders
+	#define VF_SUPPORTS_PRIMITIVE_SCENE_DATA 1u
+#endif
+
+// Disable the declaration of any templated types so we can use this shader without HLSL 2021. This is necessary because
+// cross-compilation creates bugs with ENABLE_INSTANCE_COMPACTION.
+#define ALLOW_TEMPLATES 0
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "../LightmapData.ush"
+#include "InstanceCullingCommon.ush"
+#include "InstanceCompactionCommon.ush"
+#include "../Nanite/NaniteCullingCommon.ush"
+#include "../WaveOpUtil.ush"
+#include "../ComputeShaderUtils.ush"
+
+#if SINGLE_INSTANCE_MODE
+	// Enable a load balancer optimization where all items are expected to have a single instance
+	#define LOAD_BALANCER_SINGLE_INSTANCE_MODE 1
+#endif
+
+
+#include "InstanceCullingLoadBalancer.ush"
+
+uint InstanceSceneDataSOAStride;
+uint GPUSceneNumInstances;
+uint GPUSceneNumPrimitives;
+uint GPUSceneNumLightmapDataItems;
+
+StructuredBuffer<uint> DrawCommandDescs;
+Buffer<uint> InstanceIdOffsetBuffer;
+StructuredBuffer<uint> ViewIds;
+
+uint NumViewIds;
+uint DynamicInstanceIdOffset;
+uint DynamicInstanceIdMax;
+uint NumCullingViews;
+uint CurrentBatchProcessingMode;
+
+RWStructuredBuffer<uint> InstanceIdsBufferOut;
+RWStructuredBuffer<float4> InstanceIdsBufferOutMobile;
+RWBuffer<uint> DrawIndirectArgsBufferOut;
+
+// Used for draw commands that need to use compaction to preserve instance order
+StructuredBuffer<FPackedDrawCommandCompactionData> DrawCommandCompactionData;
+RWStructuredBuffer<uint> CompactInstanceIdsBufferOut;
+RWStructuredBuffer<uint> CompactionBlockCounts;
+
+// uint per instance with 1 bit per view identified by NaniteView::InstanceOcclusionQueryMask
+Buffer<uint> InstanceOcclusionQueryBuffer;
+
+// this is just to avoid compiling packing code for unrelated shaders
+#if PLATFORM_USES_PRIMITIVE_UBO
+#include "../SceneDataMobileWriter.ush" 
+
+void WriteDataUBO(RWStructuredBuffer<float4> Output, uint Offset, uint InstanceId, FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, uint MeshLODIndex)
+{
+#if SINGLE_INSTANCE_MODE
+	WritePrimitiveDataUBO(Output, Offset, PrimitiveData, MeshLODIndex);
+#else
+	WriteInstanceDataUBO(Output, Offset, InstanceId, InstanceData, InstanceSceneDataSOAStride);
+#endif
+}
+#endif //PLATFORM_USES_PRIMITIVE_UBO
+
+void WriteInstance(uint Offset, uint InstanceId, FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, uint ViewIdIndex, uint CullingFlags, uint MeshLODIndex)
+{
+	checkSlow(InstanceId < GPUSceneNumInstances);
+
+#if PLATFORM_USES_PRIMITIVE_UBO
+	WriteDataUBO(InstanceIdsBufferOutMobile, Offset, InstanceId, PrimitiveData, InstanceData, MeshLODIndex);
+#else
+	uint PackedId = PackInstanceCullingOutput(InstanceId, ViewIdIndex, CullingFlags);
+	checkStructuredBufferAccessSlow(InstanceIdsBufferOut, Offset);
+	InstanceIdsBufferOut[Offset] = PackedId;
+#endif
+}
+
+void WriteInstanceForCompaction(uint Offset, bool bVisible, uint InstanceId, FInstanceSceneData InstanceData, uint ViewIdIndex, uint CullingFlags)
+{
+	checkSlow(InstanceId < GPUSceneNumInstances);
+
+	uint PackedId = bVisible ? PackInstanceCullingOutput(InstanceId, ViewIdIndex, CullingFlags) : 0xFFFFFFFFU;
+	checkStructuredBufferAccessSlow(CompactInstanceIdsBufferOut, Offset);
+	CompactInstanceIdsBufferOut[Offset] = PackedId;	
+}
+
+bool IsInstanceVisible(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, uint InstanceId, uint ViewIdIndex, FDrawCommandDesc DrawCommandDesc, inout uint CullingFlags)
+{
+	CullingFlags = INSTANCE_CULLING_FLAGS_DEFAULT;
+
+#if CULL_INSTANCES
+	// Should not draw invalid instances, 
+	if (!InstanceData.ValidInstance)
+	{
+		return false;
+	}
+
+	// TODO: The test for dot(InstanceData.LocalBoundsExtent, InstanceData.LocalBoundsExtent) <= 0.0f is just a workaround since the FDynamicMeshBuilder::GetMesh
+	//       seems to just set empty bounds (and FLineBatcherSceneProxy pretends everything is at the origin). In the future these should compute reasonable bounds and 
+	//       this should be removed.
+	if (dot(InstanceData.LocalBoundsExtent, InstanceData.LocalBoundsExtent) <= 0.0f)
+	{
+		return true;
+	}
+#elif ALLOW_WPO_DISABLE
+	// When culling is disabled, we don't need to do anything if we don't have to evaluate WPO disable distance
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_WPO_DISABLE_DISTANCE) == 0)
+	{
+		return true;
+	}
+#endif
+
+#if CULL_INSTANCES || ALLOW_WPO_DISABLE
+	// TODO: remove this indirection and go straight to data index
+	checkStructuredBufferAccessSlow(ViewIds, ViewIdIndex);
+
+	uint ViewDataIndex = ViewIds[ViewIdIndex];
+
+	if (ViewDataIndex < NumCullingViews)
+	{
+		FNaniteView NaniteView = GetNaniteView(ViewDataIndex);
+		FInstanceDynamicData DynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData);
+
+		FBoxCull Cull;
+		Cull.Init(
+			NaniteView,
+			InstanceData.LocalBoundsCenter,
+			InstanceData.LocalBoundsExtent,
+			InstanceData.NonUniformScale.xyz,
+			DynamicData.LocalToTranslatedWorld,
+			DynamicData.PrevLocalToTranslatedWorld );
+
+#if !CULL_INSTANCES
+		Cull.bDistanceCull				= false;
+		Cull.bSkipDrawDistance			= true;
+		Cull.bSkipCullGlobalClipPlane	= true;
+#endif
+
+#if ALLOW_WPO_DISABLE
+		Cull.bSkipWPODisableDistance	|= DrawCommandDesc.bMaterialAlwaysEvaluatesWorldPositionOffset;
+#else
+		Cull.bSkipWPODisableDistance	= true;
+#endif
+
+		bool bEnableWPO = Cull.Distance( PrimitiveData );
+		if (!bEnableWPO)
+		{
+			CullingFlags &= ~INSTANCE_CULLING_FLAG_EVALUATE_WPO;
+		}
+
+#if CULL_INSTANCES
+		Cull.ScreenSize(DrawCommandDesc.MinScreenSize, DrawCommandDesc.MaxScreenSize);
+
+		Cull.GlobalClipPlane();
+
+		BRANCH
+		if( Cull.bIsVisible )
+		{
+			Cull.Frustum();
+		}
+
+#if OCCLUSION_CULL_INSTANCES
+		BRANCH
+		if (Cull.bIsVisible)
+		{
+			const bool bPrevIsOrtho = IsOrthoProjection(NaniteView.PrevViewToClip);
+			FFrustumCullData PrevCull = BoxCullFrustum(InstanceData.LocalBoundsCenter, InstanceData.LocalBoundsExtent, DynamicData.PrevLocalToTranslatedWorld, NaniteView.PrevTranslatedWorldToClip, NaniteView.ViewToClip, bPrevIsOrtho, Cull.bNearClip, true);
+			BRANCH
+			if (PrevCull.bIsVisible && !PrevCull.bCrossesNearPlane)
+			{
+				FScreenRect PrevRect = GetScreenRect( NaniteView.HZBTestViewRect, PrevCull, 4 );
+				Cull.bIsVisible = IsVisibleHZB( PrevRect, true );
+			}
+
+			BRANCH
+			if (NaniteView.InstanceOcclusionQueryMask && Cull.bIsVisible)
+			{
+				if ((InstanceOcclusionQueryBuffer[InstanceId] & NaniteView.InstanceOcclusionQueryMask) == 0)
+				{
+					Cull.bIsVisible = false;
+				}
+			}
+		}
+#endif // OCCLUSION_CULL_INSTANCES
+#endif // CULL_INSTANCES
+
+		return Cull.bIsVisible;
+	}
+#endif // CULL_INSTANCES || ALLOW_WPO_DISABLE
+
+	return true;
+}
+
+
+/**
+ * Each thread loops over a range on instances loaded from a buffer. The instance bounds are projected to all cached virtual shadow map address space
+ * and any overlapped pages are marked as invalid.
+ */
+[numthreads(NUM_THREADS_PER_GROUP, 1, 1)]
+void InstanceCullBuildInstanceIdBufferCS(uint3 GroupId : SV_GroupID, int GroupThreadIndex : SV_GroupIndex)
+{
+	uint DispatchGroupId = GetUnWrappedDispatchGroupId(GroupId);
+
+	if (DispatchGroupId >= InstanceCullingLoadBalancer_GetNumBatches())
+	{
+		return;
+	}
+
+#if ENABLE_BATCH_MODE
+	// Load Instance culling context batch info, indirection per group
+	FContextBatchInfo BatchInfo = BatchInfos[BatchInds[DispatchGroupId]];
+#else // !ENABLE_BATCH_MODE
+	// Single Instance culling context batch in the call, set up batch from the kernel parameters
+	FContextBatchInfo BatchInfo = (FContextBatchInfo)0;
+	BatchInfo.NumViewIds = NumViewIds;
+	BatchInfo.DynamicInstanceIdOffset = DynamicInstanceIdOffset;
+	BatchInfo.DynamicInstanceIdMax = DynamicInstanceIdMax;
+#endif // ENABLE_BATCH_MODE
+
+	FInstanceWorkSetup WorkSetup = InstanceCullingLoadBalancer_Setup(GroupId, GroupThreadIndex, GetItemDataOffset(BatchInfo, CurrentBatchProcessingMode));
+
+	if (!WorkSetup.bValid)
+	{
+		return;
+	}
+
+	// Extract the draw command payload
+	const FInstanceCullingPayload Payload = LoadInstanceCullingPayload(WorkSetup.Item.Payload, BatchInfo);
+
+	uint InstanceId = WorkSetup.Item.InstanceDataOffset + uint(WorkSetup.LocalItemIndex);
+
+	// Check dynamic flag to offset the instance ID
+	if (Payload.bDynamicInstanceDataOffset)
+	{
+		InstanceId += BatchInfo.DynamicInstanceIdOffset;
+		checkSlow(InstanceId < BatchInfo.DynamicInstanceIdMax);
+	}
+
+	// Load auxiliary per-instanced-draw command info
+	const FDrawCommandDesc DrawCommandDesc = UnpackDrawCommandDesc(DrawCommandDescs[Payload.IndirectArgIndex]);
+
+	// Extract compaction data (if applicable)	
+#if ENABLE_INSTANCE_COMPACTION
+	const bool bCompactInstances = Payload.CompactionDataIndex != 0xFFFFFFFFU;
+#else
+	const bool bCompactInstances = false;
+#endif
+	uint CompactOutputInstanceIndex = 0;
+	FDrawCommandCompactionData CompactionData = (FDrawCommandCompactionData)0;	
+	BRANCH
+	if (bCompactInstances)
+	{
+		CompactionData = UnpackDrawCommandCompactionData(DrawCommandCompactionData[Payload.CompactionDataIndex]);
+		
+		const uint WorkItemLocalInstanceOffset = WorkSetup.Item.InstanceDataOffset - Payload.InstanceDataOffset;
+		CompactOutputInstanceIndex = Payload.RunInstanceOffset + WorkItemLocalInstanceOffset + uint(WorkSetup.LocalItemIndex);
+	}
+
+	// TODO: This must be read-modify-written when batching such that the final offset that is fed to the VS is correct.
+	//       Then we don't need to add the batch offset (BatchInfo.InstanceDataWriteOffset)
+	const uint InstanceDataOutputOffset = InstanceIdOffsetBuffer[Payload.IndirectArgIndex];
+
+	const FInstanceSceneData InstanceData = GetInstanceSceneData(InstanceId, InstanceSceneDataSOAStride);
+	const FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceData.PrimitiveId);
+
+	uint NumVisibleInstances = 0;
+#if STEREO_CULLING_MODE
+	uint CullingFlags0 = 0;
+	uint CullingFlags1 = 0;
+	const bool bVisible = IsInstanceVisible(PrimitiveData, InstanceData, InstanceId, BatchInfo.ViewIdsOffset + 0U, DrawCommandDesc, CullingFlags0) ||
+					      IsInstanceVisible(PrimitiveData, InstanceData, InstanceId, BatchInfo.ViewIdsOffset + 1U, DrawCommandDesc, CullingFlags1);
+	const uint CullingFlags = CullingFlags0 | CullingFlags1;
+	NumVisibleInstances += bVisible ? 2 : 0;
+	
+	BRANCH
+	if (bCompactInstances)
+	{
+		const uint OutputOffset = CompactOutputInstanceIndex * 2U;
+		WriteInstanceForCompaction(CompactionData.SrcInstanceIdOffset + OutputOffset + 0U, bVisible, InstanceId, InstanceData, 0U, CullingFlags);
+		WriteInstanceForCompaction(CompactionData.SrcInstanceIdOffset + OutputOffset + 1U, bVisible, InstanceId, InstanceData, 1U, CullingFlags);
+	}
+	else if (bVisible)
+	{
+		uint OutputOffset;
+		InterlockedAdd(DrawIndirectArgsBufferOut[Payload.IndirectArgIndex * INDIRECT_ARGS_NUM_WORDS + 1], 2U, OutputOffset);
+		WriteInstance(InstanceDataOutputOffset + (OutputOffset + 0U) * INSTANCE_DATA_STRIDE_ELEMENTS, InstanceId, PrimitiveData, InstanceData, 0U, CullingFlags, DrawCommandDesc.MeshLODIndex);
+		WriteInstance(InstanceDataOutputOffset + (OutputOffset + 1U) * INSTANCE_DATA_STRIDE_ELEMENTS, InstanceId, PrimitiveData, InstanceData, 1U, CullingFlags, DrawCommandDesc.MeshLODIndex);
+	}
+#else // !STEREO_CULLING_MODE
+
+	for (uint ViewIdIndex = 0; ViewIdIndex < BatchInfo.NumViewIds; ++ViewIdIndex)
+	{
+		// Culling is disabled for multi-view
+		uint CullingFlags = 0;
+		bool bVisible = IsInstanceVisible(PrimitiveData, InstanceData, InstanceId, BatchInfo.ViewIdsOffset + ViewIdIndex, DrawCommandDesc, CullingFlags);
+
+		NumVisibleInstances += bVisible ? 1 : 0;
+		
+		BRANCH
+		if (bCompactInstances)
+		{
+			const uint OutputOffset = CompactOutputInstanceIndex * BatchInfo.NumViewIds + ViewIdIndex;
+			WriteInstanceForCompaction(CompactionData.SrcInstanceIdOffset + OutputOffset, bVisible, InstanceId, InstanceData, ViewIdIndex, CullingFlags);
+		}
+		else if (bVisible)
+		{
+			// TODO: if all items in the group-batch target the same draw args the more efficient warp-collective functions can be used
+			//       detected as FInstanceBatch.NumItems == 1. Can switch dynamically or bin the items that fill a group and dispatch separately with permutation.
+			// TODO: if the arg only has a single item, and culling is not enabled, then we can skip the atomics. Again do dynamically or separate permutation.
+			uint OutputOffset;
+			InterlockedAdd(DrawIndirectArgsBufferOut[Payload.IndirectArgIndex * INDIRECT_ARGS_NUM_WORDS + 1], 1U, OutputOffset);
+			WriteInstance(InstanceDataOutputOffset + OutputOffset * INSTANCE_DATA_STRIDE_ELEMENTS, InstanceId, PrimitiveData, InstanceData, ViewIdIndex, CullingFlags, DrawCommandDesc.MeshLODIndex);
+		}
+	}
+#endif // STEREO_CULLING_MODE
+
+	BRANCH
+	if (bCompactInstances && NumVisibleInstances > 0)
+	{
+		// Determine compaction block and atomically increment its count
+		const uint BlockIndex = GetCompactionBlockIndexFromInstanceIndex(CompactOutputInstanceIndex);
+		InterlockedAdd(CompactionBlockCounts[CompactionData.BlockOffset + BlockIndex], NumVisibleInstances);
+	}
+}
+
+
+uint NumIndirectArgs;
+/**
+ */
+[numthreads(NUM_THREADS_PER_GROUP, 1, 1)]
+void ClearIndirectArgInstanceCountCS(uint3 GroupId : SV_GroupID, int GroupThreadIndex : SV_GroupIndex)
+{
+	uint IndirectArgIndex = GetUnWrappedDispatchThreadId(GroupId, GroupThreadIndex, NUM_THREADS_PER_GROUP);
+
+	if (IndirectArgIndex < NumIndirectArgs)
+	{
+		DrawIndirectArgsBufferOut[IndirectArgIndex * INDIRECT_ARGS_NUM_WORDS + 1] = 0U;
+	}
+}

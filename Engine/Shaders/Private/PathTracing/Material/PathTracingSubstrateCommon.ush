@@ -1,0 +1,51 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#ifndef SUBSTRATE_ENABLED
+#error "This header should only be included when Substrate is enabled."
+#endif
+
+#include "../PathTracingCommon.ush"
+
+#define SUBSTRATE_FRESNEL_F82  0
+
+#define SUBSTRATE_PATH_TRACING_GLINTS (SUBSTRATE_COMPLEXSPECIALPATH && PLATFORM_ENABLES_SUBSTRATE_GLINTS)
+
+#if SUBSTRATE_PATH_TRACING_GLINTS
+#include "/Engine/Private/Substrate/Glint/GlintThirdParty.ush"
+#endif
+
+float3 SubstrateLobeWeight(FPathTracingPayload Payload, float SatNoL)
+{
+	// See reference in LuminanceWeight
+	const float DistanceL = rcp(max(SatNoL, 0.001f));
+	const float3 TransmittanceAboveAlongL = select(Payload.TransmittanceN < 1.f, pow(max(Payload.TransmittanceN, 0.0001f), DistanceL), Payload.TransmittanceN);
+	return Payload.BSDFOpacity * Payload.WeightV * lerp(1.0f, TransmittanceAboveAlongL, Payload.CoverageAboveAlongN);
+}
+
+float3 SubstrateSpecularTint(FPathTracingPayload Payload, float NoV, float NoL, float VoH, float NoH)
+{
+	float3 Out = 1.f;
+	BRANCH
+	if (Payload.SpecularProfileId != 0)
+	{
+		Out = EvaluateSpecularProfile(Payload.SpecularProfileId, NoV, NoL, VoH, NoH);
+	}
+	return Out;
+}
+
+void SubstrateGlint(FPathTracingPayload Payload, float3 InTangentV, float3 InTangentL, float2 InAlphaXY, in float InPdf, inout float OutWeight)
+{
+	// For now use the GGX lobe sampling. This will be changed with glint importance sampling later on.
+#if SUBSTRATE_PATH_TRACING_GLINTS
+	BRANCH
+	if (Payload.GlintValue > 0)
+	{
+		const float2 GGXRoughnessXY = float2(sqrtFast(InAlphaXY.x), sqrtFast(InAlphaXY.y));
+		FBeckmannDesc Beckmann = GGXToBeckmann(GGXRoughnessXY);
+		const float Fs = f_P(InTangentV, InTangentL, float3(Beckmann.Sigma, Beckmann.Rho), Payload.GlintValue, Payload.GlintUV, Payload.GlintUVdx, Payload.GlintUVdy, true /*bIncludeGeometryTerm*/);
+		OutWeight = Fs / max(0.0001f, InPdf);
+	}
+#endif
+}

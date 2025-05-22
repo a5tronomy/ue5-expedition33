@@ -1,0 +1,1830 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// This must be defined before including Common.ush (see GetShadowReplaceState)
+#define SHADOW_DEPTH_SHADER DEPTH_ONLY
+
+#define SPLIT_WORK_QUEUE NANITE_TESSELLATION	// TODO: Remove once shader rewriter has been fixed (UE-202409)
+
+#include "NaniteRasterizationCommon.ush"
+#include "../VirtualShadowMaps/VirtualShadowMapPageAccessCommon.ush"
+#include "../VirtualShadowMaps/VirtualShadowMapPageOverlap.ush"
+#include "NaniteWritePixel.ush"
+#include "NaniteCullingCommon.ush"
+#include "../ComputeShaderUtils.ush"
+#include "../Random.ush"
+
+#if NANITE_TESSELLATION
+#include "NaniteTessellation.ush"
+#include "NaniteDice.ush"
+#endif
+
+// Update this GUID to bump and recompile all Nanite rasterization material shaders
+// Merge conflicts on this line should be resolved by generating a new GUID
+#pragma message("UESHADERMETADATA_VERSION 59798E00-C394-440A-B3BA-E342488CF154")
+
+#if PIXELSHADER
+ALLOW_NO_PS_EXPORT
+#endif
+
+#ifndef NANITE_MESH_SHADER
+#define NANITE_MESH_SHADER 0
+#endif
+
+#ifndef NANITE_PRIM_SHADER
+#define NANITE_PRIM_SHADER 0
+#endif
+
+#ifndef NANITE_VERT_REUSE_BATCH
+#define NANITE_VERT_REUSE_BATCH 0
+#endif
+
+#ifndef NANITE_TWO_SIDED
+#define NANITE_TWO_SIDED 0
+#endif
+
+#define NANITE_HW_RASTER_INTERPOLATE_DEPTH (DEPTH_ONLY)
+
+#if NANITE_VERT_REUSE_BATCH
+	#define THREADGROUP_SIZE 32
+#else
+	#define THREADGROUP_SIZE 64
+#endif
+
+#if COMPUTESHADER && NANITE_PIXEL_PROGRAMMABLE && !NANITE_TESSELLATION
+MAX_OCCUPANCY
+#endif
+
+HOIST_DESCRIPTORS
+
+uint ActiveRasterBin;
+
+RWStructuredBuffer<FNaniteStats> OutStatsBuffer;
+
+StructuredBuffer<FNaniteRasterBinMeta> RasterBinMeta;
+
+StructuredBuffer<uint2> RasterBinData;
+
+// .x = VisibleIndex
+// .y = RangeStart
+// .z = RangeEnd
+// .w = MaterialFlags
+uint4 FetchSWRasterBin(const uint ClusterIndex)
+{
+	const uint RasterBinOffset		= RasterBinMeta[ActiveRasterBin].ClusterOffset;
+	const uint2 PackedData			= RasterBinData[RasterBinOffset + ClusterIndex].xy;
+	const uint VisibleIndex			= PackedData.x;
+	const uint RangeStart			= PackedData.y >> 16u;
+	const uint RangeEnd				= PackedData.y & 0xFFFFu;
+	return uint4(VisibleIndex, RangeStart, RangeEnd, RasterBinMeta[ActiveRasterBin].MaterialFlags);
+}
+
+// .x = VisibleIndex
+// .y = RangeStart
+// .z = RangeEnd
+// .w = MaterialFlags
+uint4 FetchHWRasterBin(const uint ClusterIndex)
+{
+	const uint RasterBinOffset		= RasterBinMeta[ActiveRasterBin].ClusterOffset;
+	const uint RasterBinCapacity	= RasterBinMeta[ActiveRasterBin].BinSWCount + RasterBinMeta[ActiveRasterBin].BinHWCount;
+	const uint2 PackedData			= RasterBinData[RasterBinOffset + ((RasterBinCapacity - 1) - ClusterIndex)].xy; // HW clusters are written from the top
+	const uint VisibleIndex			= PackedData.x;
+	const uint RangeStart			= PackedData.y >> 16u;
+	const uint RangeEnd				= PackedData.y & 0xFFFFu;
+	return uint4(VisibleIndex, RangeStart, RangeEnd, RasterBinMeta[ActiveRasterBin].MaterialFlags);
+}
+
+ViewState ResolveView(FNaniteView NaniteView)
+{
+	ViewState Ret = ResolveView();
+	Ret.SVPositionToTranslatedWorld	= NaniteView.SVPositionToTranslatedWorld;
+	Ret.ViewToTranslatedWorld 		= NaniteView.ViewToTranslatedWorld;
+	Ret.TranslatedWorldToView 		= NaniteView.TranslatedWorldToView;
+	Ret.TranslatedWorldToClip 		= NaniteView.TranslatedWorldToClip;
+	Ret.ViewToClip 					= NaniteView.ViewToClip;
+	Ret.ClipToWorld 				= NaniteView.ClipToWorld;
+	Ret.PrevTranslatedWorldToView 	= NaniteView.PrevTranslatedWorldToView;
+	Ret.PrevTranslatedWorldToClip 	= NaniteView.PrevTranslatedWorldToClip;
+	Ret.PrevViewToClip 				= NaniteView.PrevViewToClip;
+	Ret.PrevClipToWorld 			= NaniteView.PrevClipToWorld;
+	Ret.ViewRectMin					= (float4)NaniteView.ViewRect;
+	Ret.ViewSizeAndInvSize 			= NaniteView.ViewSizeAndInvSize;
+	Ret.PreViewTranslation 			= NaniteView.PreViewTranslation;
+	Ret.PrevPreViewTranslation 		= NaniteView.PrevPreViewTranslation;
+	Ret.ViewForward 				= NaniteView.ViewForward;
+	Ret.ViewOriginHigh 				= NaniteView.ViewOriginHigh;
+	Ret.NearPlane 					= NaniteView.NearPlane;
+
+	// HACK: This fixes some material nodes for shadows, as shadow views borrow some view uniforms from the closest
+	// camera view, rather than exposing their own parameters.
+	Ret.WorldCameraOrigin = DFFastSubtract(NaniteView.CullingViewOriginTranslatedWorld, NaniteView.PreViewTranslation);
+
+#if VIEW_HAS_TILEOFFSET_DATA
+	Ret.TileOffset.PreViewTranslation = DFToTileOffset(Ret.PreViewTranslation);
+	Ret.TileOffset.PrevPreViewTranslation = DFToTileOffset(Ret.PrevPreViewTranslation);
+	//Ret.TileOffset.WorldViewOrigin = DFToTileOffset(Ret.WorldViewOrigin);
+	//Ret.TileOffset.PrevWorldViewOrigin = DFToTileOffset(Ret.PrevWorldViewOrigin);
+	Ret.TileOffset.WorldCameraOrigin = DFToTileOffset(Ret.WorldCameraOrigin);
+	//Ret.TileOffset.PrevWorldCameraOrigin = DFToTileOffset(Ret.PrevWorldCameraOrigin);
+#endif
+
+	return Ret;
+}
+
+// Default cull mode is CW. If this returns true, CCW culling is required
+bool ReverseWindingOrder(FNaniteView NaniteView, FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData)
+{
+	// Negative determinant sign for non uniform scale means that an odd number of components are negative, so
+	// we need to reverse the triangle winding order.
+	float DeterminantSign = InstanceData.DeterminantSign;
+	bool bReverseInstanceCull = (DeterminantSign < 0.0f);
+
+#if SUPPORT_REVERSE_CULLING_IN_NANITE
+	if (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_REVERSE_CULLING)
+	{
+		// reverse culling if the primitive has elected to do so
+		bReverseInstanceCull = !bReverseInstanceCull;
+	}
+#endif
+
+	bool bViewReverseCull = (NaniteView.Flags & NANITE_VIEW_FLAG_REVERSE_CULLING);
+	
+	// Logical XOR
+	return (bReverseInstanceCull != bViewReverseCull);
+}
+
+StructuredBuffer< uint2 >	InTotalPrevDrawClusters;
+Buffer<uint>				InClusterOffsetSWHW;
+
+struct FTriRange
+{
+	uint Start;
+	uint Num;
+};
+
+FTriRange GetIndexAndTriRangeSW( inout uint VisibleIndex )
+{
+	FTriRange Range = { 0, 0 };
+
+	uint4 RasterBin = FetchSWRasterBin(VisibleIndex);
+	VisibleIndex = RasterBin.x;
+	Range.Start = RasterBin.y;
+	Range.Num = RasterBin.z - RasterBin.y;
+
+	return Range;
+}
+
+FTriRange GetIndexAndTriRangeHW( inout uint VisibleIndex )
+{
+	FTriRange Range = { 0, 0 };
+
+	uint4 RasterBin = FetchHWRasterBin(VisibleIndex);
+	VisibleIndex = RasterBin.x;
+	Range.Start = RasterBin.y;
+	Range.Num = RasterBin.z - RasterBin.y;
+
+	return Range;
+}
+
+FRaster CreateRaster( FNaniteView NaniteView, FInstanceSceneData InstanceData, FVisibleCluster VisibleCluster )
+{
+	FRaster Raster;
+	Raster.ScissorRect = NaniteView.ViewRect;
+
+	// DX11 spec
+	// x = (x + 1) * ViewSize.x * 0.5 + ViewRect.x;
+	// y = (1 - y) * ViewSize.y * 0.5 + ViewRect.y;
+	Raster.ViewportScale = float2(0.5, -0.5) * NaniteView.ViewSizeAndInvSize.xy;
+	Raster.ViewportBias = 0.5 * NaniteView.ViewSizeAndInvSize.xy + NaniteView.ViewRect.xy;
+
+#if VIRTUAL_TEXTURE_TARGET
+	// Scalar
+	Raster.vPage = VisibleCluster.vPage;
+	Raster.pPage = 0;
+	Raster.bSinglePage = all( VisibleCluster.vPage == VisibleCluster.vPageEnd );
+	if (Raster.bSinglePage)
+	{
+		FShadowPhysicalPage PhysicalPage = ShadowGetPhysicalPage( CalcPageOffset( NaniteView.TargetLayerIndex, NaniteView.TargetMipLevel, Raster.vPage ) );
+		Raster.pPage = PhysicalPage.bThisLODValid ? PhysicalPage.PhysicalAddress : 0xffff;
+	}
+
+	// Virtual shadow maps can scatter instances into different physical pages for caching purposes
+	const bool bCacheAsStatic = (VisibleCluster.Flags & NANITE_CULLING_FLAG_CACHE_AS_STATIC) != 0u;
+	Raster.ArrayIndex = bCacheAsStatic ? GetVirtualShadowMapStaticArrayIndex() : 0;
+
+	if (!Raster.bSinglePage)
+	{
+	#if NANITE_LATE_VSM_PAGE_TRANSLATION
+		Raster.ScissorRect.xy = 0;
+		Raster.ScissorRect.zw = (VisibleCluster.vPageEnd - VisibleCluster.vPage) * VSM_PAGE_SIZE + VSM_PAGE_SIZE;
+	#else
+		Raster.vPage = 0;
+		Raster.ScissorRect.xy = VisibleCluster.vPage * VSM_PAGE_SIZE;
+		Raster.ScissorRect.zw = VisibleCluster.vPageEnd * VSM_PAGE_SIZE + VSM_PAGE_SIZE;
+	#endif
+	}
+	else
+	{
+		Raster.ScissorRect.xy = Raster.pPage * VSM_PAGE_SIZE;
+		Raster.ScissorRect.zw = Raster.ScissorRect.xy + VSM_PAGE_SIZE;
+	}
+
+	Raster.vTranslation = ( (float2)Raster.pPage - (float2)Raster.vPage ) * VSM_PAGE_SIZE;
+	Raster.ViewportBias += Raster.vTranslation;
+#endif
+
+	Raster.ViewportScale *= NANITE_SUBPIXEL_SAMPLES;
+	Raster.ViewportBias  *= NANITE_SUBPIXEL_SAMPLES;
+	Raster.ViewportBias  += 0.5f;
+
+	return Raster;
+}
+
+#if PATCHES
+	#define VERTEX_CACHE_SIZE 120		// (MaxTessFactor+1)*(MaxTessFactor+2)/2
+#else
+	#define VERTEX_CACHE_SIZE 256
+#endif
+groupshared float3 GroupVerts[VERTEX_CACHE_SIZE];
+
+struct FCachedVertex
+{
+	FNaniteTransformedVert TransformedVert;
+	float4 PointSubpixelClip;
+};
+
+// 64 rolling window vertex cache for pixel programmable shaders.
+// The expectation is that most materials will only require PointSubpixelClip and maybe 1/2 UV sets and the rest will be DCE'd
+groupshared float3 VertexCache_PointLocal[64];
+groupshared float3 VertexCache_PointPostDeform[64];
+groupshared float3 VertexCache_PrevPointPostDeform[64];
+groupshared float3 VertexCache_PointWorld[64];
+groupshared float3 VertexCache_PointWorld_NoOffset[64];
+groupshared float4 VertexCache_PointClip[64];
+groupshared half3  VertexCache_NormalPostDeform[64];
+groupshared float4 VertexCache_NormalClip[64];
+groupshared float4 VertexCache_TangentX_AndSign[64];
+groupshared float3 VertexCache_TangentZ[64];
+groupshared float4 VertexCache_Color[64];
+groupshared float2 VertexCache_TexCoords0[64];
+groupshared float2 VertexCache_TexCoords1[64];
+groupshared float2 VertexCache_TexCoords2[64];
+groupshared float2 VertexCache_TexCoords3[64];
+groupshared float2 VertexCache_CustomizedUVs0[64];
+groupshared float2 VertexCache_CustomizedUVs1[64];
+groupshared float2 VertexCache_CustomizedUVs2[64];
+groupshared float2 VertexCache_CustomizedUVs3[64];
+groupshared float4 VertexCache_PointSubpixelClip[64];
+
+HLSL_STATIC_ASSERT( sizeof( FCachedVertex ) == 204 + 8 * NUM_TEX_COORD_INTERPOLATORS, "Unexpected size of FCachedVertex. Update StoreVertexToLDS to reflect changes." );
+void StoreVertexToLDS( uint VertexIndex, FCachedVertex Vertex )
+{
+	const uint CacheIndex = VertexIndex & 63u;
+
+	VertexCache_PointLocal[CacheIndex]			= Vertex.TransformedVert.PointLocal;
+	VertexCache_PointPostDeform[CacheIndex]		= Vertex.TransformedVert.PointPostDeform;
+	VertexCache_PrevPointPostDeform[CacheIndex]	= Vertex.TransformedVert.PrevPointPostDeform;
+	VertexCache_PointWorld[CacheIndex]			= Vertex.TransformedVert.PointWorld;
+	VertexCache_PointWorld_NoOffset[CacheIndex]	= Vertex.TransformedVert.PointWorld_NoOffset;
+	VertexCache_PointClip[CacheIndex]			= Vertex.TransformedVert.PointClip;
+	VertexCache_NormalPostDeform[CacheIndex]	= Vertex.TransformedVert.NormalPostDeform;
+	VertexCache_NormalClip[CacheIndex]			= Vertex.TransformedVert.NormalClip;
+	VertexCache_TangentX_AndSign[CacheIndex]	= Vertex.TransformedVert.RawAttributeData.TangentX_AndSign;
+	VertexCache_TangentZ[CacheIndex]			= Vertex.TransformedVert.RawAttributeData.TangentZ;
+	VertexCache_Color[CacheIndex]				= Vertex.TransformedVert.RawAttributeData.Color;
+	VertexCache_TexCoords0[CacheIndex]			= Vertex.TransformedVert.RawAttributeData.TexCoords[0];
+	VertexCache_TexCoords1[CacheIndex]			= Vertex.TransformedVert.RawAttributeData.TexCoords[1];
+	VertexCache_TexCoords2[CacheIndex]			= Vertex.TransformedVert.RawAttributeData.TexCoords[2];
+	VertexCache_TexCoords3[CacheIndex]			= Vertex.TransformedVert.RawAttributeData.TexCoords[3];
+
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+	VertexCache_CustomizedUVs0[CacheIndex]		= Vertex.TransformedVert.CustomizedUVs[0];
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS > 1
+	VertexCache_CustomizedUVs1[CacheIndex]		= Vertex.TransformedVert.CustomizedUVs[1];
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS > 2
+	VertexCache_CustomizedUVs2[CacheIndex]		= Vertex.TransformedVert.CustomizedUVs[2];
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS > 3
+	VertexCache_CustomizedUVs3[CacheIndex]		= Vertex.TransformedVert.CustomizedUVs[3];
+#endif
+
+	VertexCache_PointSubpixelClip[CacheIndex]	= Vertex.PointSubpixelClip;
+}
+
+HLSL_STATIC_ASSERT( sizeof( FCachedVertex ) == 204 + 8 * NUM_TEX_COORD_INTERPOLATORS, "Unexpected size of FCachedVertex. Update LoadVertexFromLDS to reflect changes." );
+FCachedVertex LoadVertexFromLDS( uint VertexIndex )
+{	
+	const uint CacheIndex = VertexIndex & 63u;
+
+	FCachedVertex Result;
+	Result.TransformedVert.VertIndex						= VertexIndex;
+	Result.TransformedVert.PointLocal						= VertexCache_PointLocal[CacheIndex];
+	Result.TransformedVert.PointPostDeform					= VertexCache_PointPostDeform[CacheIndex];
+	Result.TransformedVert.PrevPointPostDeform				= VertexCache_PrevPointPostDeform[CacheIndex];
+	Result.TransformedVert.PointWorld						= VertexCache_PointWorld[CacheIndex];
+	Result.TransformedVert.PointWorld_NoOffset				= VertexCache_PointWorld_NoOffset[CacheIndex];
+	Result.TransformedVert.PointClip						= VertexCache_PointClip[CacheIndex];
+	Result.TransformedVert.NormalPostDeform					= VertexCache_NormalPostDeform[CacheIndex];
+	Result.TransformedVert.NormalClip						= VertexCache_NormalClip[CacheIndex];
+	Result.TransformedVert.RawAttributeData.TangentX_AndSign= VertexCache_TangentX_AndSign[CacheIndex];
+	Result.TransformedVert.RawAttributeData.TangentZ		= VertexCache_TangentZ[CacheIndex];
+	Result.TransformedVert.RawAttributeData.Color			= VertexCache_Color[CacheIndex];
+	Result.TransformedVert.RawAttributeData.TexCoords[0]	= VertexCache_TexCoords0[CacheIndex];
+	Result.TransformedVert.RawAttributeData.TexCoords[1]	= VertexCache_TexCoords1[CacheIndex];
+	Result.TransformedVert.RawAttributeData.TexCoords[2]	= VertexCache_TexCoords2[CacheIndex];
+	Result.TransformedVert.RawAttributeData.TexCoords[3]	= VertexCache_TexCoords3[CacheIndex];
+
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+	Result.TransformedVert.CustomizedUVs[0]					= VertexCache_CustomizedUVs0[CacheIndex];
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS > 1
+	Result.TransformedVert.CustomizedUVs[1]					= VertexCache_CustomizedUVs1[CacheIndex];
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS > 2
+	Result.TransformedVert.CustomizedUVs[2]					= VertexCache_CustomizedUVs2[CacheIndex];
+#endif
+#if NUM_TEX_COORD_INTERPOLATORS > 3
+	Result.TransformedVert.CustomizedUVs[3]					= VertexCache_CustomizedUVs3[CacheIndex];
+#endif
+
+	Result.PointSubpixelClip								= VertexCache_PointSubpixelClip[CacheIndex];
+
+	return Result;
+}
+
+void ClusterRasterize( uint VisibleIndex, uint GroupThreadIndex ) 
+{
+	FTriRange TriRange = GetIndexAndTriRangeSW( VisibleIndex );
+
+	// Should be all scalar.
+	FVisibleCluster VisibleCluster = GetVisibleCluster( VisibleIndex, VIRTUAL_TEXTURE_TARGET );
+	
+	FPrimitiveSceneData PrimitiveData;
+	FInstanceSceneData InstanceData;
+	GetNaniteMaterialSceneData(VisibleCluster, PrimitiveData, InstanceData);
+
+	FNaniteView NaniteView = GetNaniteView( VisibleCluster.ViewId );
+#if ALWAYS_EVALUATE_WORLD_POSITION_OFFSET
+	const bool bEvaluateWPO = true;
+#else
+	const bool bEvaluateWPO = (VisibleCluster.Flags & NANITE_CULLING_FLAG_ENABLE_WPO) != 0;
+#endif
+	const bool bReverseWindingOrder = ReverseWindingOrder(NaniteView, PrimitiveData, InstanceData);
+
+#if NANITE_VERTEX_PROGRAMMABLE || NANITE_PIXEL_PROGRAMMABLE
+	ResolvedView = ResolveView(NaniteView);
+#endif
+	
+	FInstanceDynamicData InstanceDynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData);
+
+	FCluster Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+	if( TriRange.Num == 0 )
+		TriRange.Num = Cluster.NumTris;
+
+	FMaterialShader MaterialShader;
+
+#if NANITE_VERTEX_PROGRAMMABLE || NANITE_PIXEL_PROGRAMMABLE
+	MaterialShader.InstanceData			= InstanceData;
+	MaterialShader.InstanceDynamicData	= InstanceDynamicData;
+	MaterialShader.NaniteView			= NaniteView;
+	MaterialShader.Cluster 				= Cluster;
+	MaterialShader.VertTransforms 		= CalculateNaniteVertexTransforms( InstanceData, InstanceDynamicData, NaniteView );
+#endif
+
+	FRaster Raster = CreateRaster( NaniteView, InstanceData, VisibleCluster );
+
+#if VIRTUAL_TEXTURE_TARGET && NANITE_LATE_VSM_PAGE_TRANSLATION
+	if (!Raster.bSinglePage)
+	{
+		UNROLL
+		for (uint Offset = 0; Offset < NANITE_VSM_PAGE_TABLE_CACHE_DIM * NANITE_VSM_PAGE_TABLE_CACHE_DIM; Offset += THREADGROUP_SIZE)
+		{
+			FetchAndCachePageTableEntry(NaniteView, VisibleCluster.vPage, VisibleCluster.vPageEnd, Offset + GroupThreadIndex);
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+#endif
+
+#if NANITE_TESSELLATION
+#if USES_DISPLACEMENT
+	MaterialShader.DisplacementCenter = RasterBinMeta[ActiveRasterBin].MaterialDisplacementCenter;
+	MaterialShader.DisplacementMagnitude = RasterBinMeta[ActiveRasterBin].MaterialDisplacementMagnitude;
+#endif
+
+	uint TriIndex = TriRange.Start + GroupThreadIndex;
+	bool bTriValid = GroupThreadIndex < TriRange.Num;
+
+	uint3 VertIndexes = 0;
+	if( bTriValid )
+	{
+		VertIndexes = DecodeTriangleIndices(Cluster, TriIndex);
+	}
+
+	uint NumUniqueVerts;
+	uint LaneVertIndex;
+	uint3 VertLaneIndexes;
+	DeduplicateVertIndexes( VertIndexes, GroupThreadIndex, bTriValid, NumUniqueVerts, LaneVertIndex, VertLaneIndexes );
+
+	FNaniteTransformedVert Vert;
+	float3 PointView;
+
+	if (GroupThreadIndex < NumUniqueVerts)
+	{
+		Vert = FetchTransformedNaniteVertex( PrimitiveData, InstanceData, MaterialShader.VertTransforms, Cluster, LaneVertIndex, bEvaluateWPO );
+		PointView = mul( float4( Vert.PointWorld, 1 ), NaniteView.TranslatedWorldToView ).xyz;
+	}
+
+	float3 TriPointView[3];
+	TriPointView[0] = WaveReadLaneAt( PointView, VertLaneIndexes[0] );
+	TriPointView[1] = WaveReadLaneAt( PointView, VertLaneIndexes[1] );
+	TriPointView[2] = WaveReadLaneAt( PointView, VertLaneIndexes[2] );
+
+	float3 TessFactors = GetTessFactors( NaniteView, TriPointView );
+
+	const uint ImmediateSplitLimit = 8;
+
+	bool bCanDice = max3( TessFactors.x, TessFactors.y, TessFactors.z ) <= NANITE_TESSELLATION_TABLE_IMMEDIATE_SIZE;
+
+	if( WaveActiveAnyTrue( bCanDice ) )
+	{
+		FDiceTask DiceTask;
+		DiceTask.Raster				= Raster;
+		DiceTask.Shader				= MaterialShader;
+		DiceTask.PixelValue			= ( VisibleIndex + 1 ) << 7;
+		DiceTask.VisualizeValues	= GetVisualizeValues();
+		DiceTask.UVDensities		= GetMaterialUVDensities( Cluster, InstanceData.PrimitiveId, TriRange.Start );
+		DiceTask.bReverseWinding	= bReverseWindingOrder;
+		DiceTask.Vert				= Vert;
+
+		DiceTask.CacheToLDS();
+
+		uint NumVerts = 0;
+		uint NumTris = 0;
+		if( bTriValid && bCanDice )
+		{
+			DiceTask.Init( TessFactors, VertLaneIndexes, TriIndex );
+			NumVerts = DiceTask.TessellatedPatch.GetNumVerts();
+			NumTris  = DiceTask.TessellatedPatch.GetNumTris();
+		}
+
+		BRANCH
+		if ((RenderFlags & NANITE_RENDER_FLAG_WRITE_STATS) != 0u)
+		{
+			WaveInterlockedAdd(OutStatsBuffer[0].NumDicedTrianglesClusters, NumTris);
+			WaveInterlockedAddScalar(OutStatsBuffer[0].NumImmediatePatches, 1);
+		}
+
+		DistributeWork( DiceTask, GroupThreadIndex, NumTris );
+	}
+
+	if( VIRTUAL_TEXTURE_TARGET == 0 )
+	{
+		FClusterSplitTask SplitTask;
+
+		uint NumVerts = 0;
+		uint NumTris = 0;
+		if( bTriValid && !bCanDice )
+		{
+			float3 SplitFactors = min( GetSplitFactors( TessFactors ), ImmediateSplitLimit );
+
+			SplitTask.Init( SplitFactors, VisibleIndex, TriIndex );
+			NumVerts = SplitTask.TessellatedPatch.GetNumVerts();
+			NumTris  = SplitTask.TessellatedPatch.GetNumTris();
+		}
+
+		DistributeWork( SplitTask, GroupThreadIndex, NumTris );
+	}
+	else if( bTriValid && !bCanDice )
+	{
+		uint WriteOffset = SplitWorkQueue.Add();
+		if( WriteOffset < SplitWorkQueue.Size )
+		{
+			uint4 Encoded;
+			Encoded.x = ( VisibleIndex << 7 ) | TriIndex;
+			Encoded.y = BarycentricMax;
+			Encoded.z = BarycentricMax << 16;
+			Encoded.w = 0;
+
+			checkSlow(
+				Encoded.x != ~0u &&
+				Encoded.y != ~0u &&
+				Encoded.z != ~0u &&
+				Encoded.w != ~0u );
+	
+			SplitWorkQueue.DataBuffer.Store4( WriteOffset * 16, Encoded );
+		}
+	}
+
+#elif NANITE_PIXEL_PROGRAMMABLE
+
+	// We can assume wave size >= 32 here as we force HW raster for hardware that can use smaller wave sizes
+
+	FCachedVertex TriangleVerts[3];
+	FNaniteTransformedVert CachedTransformedVerts[2];
+
+	// TODO: DXC doesn't manage to strip all the unused groupshared arrays, which is very bad for performance.
+	//       When manually stripped, the groupshared version is faster, so we should revisit once this has been fixed.
+	const bool bGroupsharedCache = !COMPILER_DXC;
+
+	uint NumCachedVerts = 0;
+	for( uint FirstTriIndex = 0; FirstTriIndex < TriRange.Num; FirstTriIndex += 32 )
+	{
+		const uint TriIndex = TriRange.Start + FirstTriIndex + GroupThreadIndex;
+		const bool bTriValid = TriIndex < TriRange.Num;
+
+		uint3 VertIndexes = 0;
+		if( bTriValid )
+		{
+			VertIndexes = DecodeTriangleIndices(Cluster, TriIndex);
+			if( bReverseWindingOrder )
+				VertIndexes.yz = VertIndexes.zy;
+		}
+
+		UNROLL
+		for( uint k = 0; k < 3; k++ )
+		{
+			const uint Index = VertIndexes[k];
+
+			BRANCH
+			if( bGroupsharedCache )
+			{
+				TriangleVerts[k] = LoadVertexFromLDS( Index );
+			}
+			else
+			{
+				const FNaniteTransformedVert A = WaveReadLaneAt( CachedTransformedVerts[0], Index & 31 );
+				const FNaniteTransformedVert B = WaveReadLaneAt( CachedTransformedVerts[1], Index & 31 );
+				
+				FCachedVertex Vert;
+				if( (Index - NumCachedVerts ) & 32 )
+					Vert.TransformedVert = A;
+				else
+					Vert.TransformedVert = B;
+
+				Vert.PointSubpixelClip = VertexCache_PointSubpixelClip[Index & 63];
+
+				TriangleVerts[k] = Vert;
+			}
+		}
+
+		const uint MaxVertIndex = max( VertIndexes.y, VertIndexes.z );
+
+        while( WaveActiveAnyTrue( MaxVertIndex >= NumCachedVerts ) )
+		{
+			// Transform and store next batch of vertices
+			{
+				const uint LaneVertIndex = NumCachedVerts + GroupThreadIndex;
+
+				FCachedVertex Vert;
+				
+				BRANCH
+				if( LaneVertIndex < Cluster.NumVerts )		// Ideally, we would be testing against the number of verts for the range, not the whole cluster.
+				{
+					Vert.TransformedVert = FetchTransformedNaniteVertex( PrimitiveData, InstanceData, MaterialShader.VertTransforms, Cluster, LaneVertIndex, bEvaluateWPO );
+					Vert.PointSubpixelClip = CalculateSubpixelCoordinates( Raster, Vert.TransformedVert.PointClip );
+				}
+
+				GroupMemoryBarrierWithGroupSync();
+
+				BRANCH
+				if( bGroupsharedCache )
+				{
+					StoreVertexToLDS( LaneVertIndex, Vert );
+				}
+				else
+				{
+					CachedTransformedVerts[1] = CachedTransformedVerts[0];
+					CachedTransformedVerts[0] = Vert.TransformedVert;
+
+					VertexCache_PointSubpixelClip[LaneVertIndex & 63] = Vert.PointSubpixelClip;
+				}
+				GroupMemoryBarrierWithGroupSync();
+			}
+            
+            UNROLL
+            for( uint k = 0; k < 3; k++ )
+            {
+				const uint Index = VertIndexes[k];
+
+				FCachedVertex Vert;
+				if( bGroupsharedCache )
+				{
+					Vert = LoadVertexFromLDS( Index );
+				}
+				else
+				{
+					Vert.TransformedVert = WaveReadLaneAt( CachedTransformedVerts[0], Index & 31 );	// After refill any new vertex will be in CachedVertex[0]
+					Vert.PointSubpixelClip = VertexCache_PointSubpixelClip[Index & 63];
+				}
+				
+				if( Index >= NumCachedVerts )
+					TriangleVerts[k] = Vert;
+            }
+
+			NumCachedVerts += 32;
+        }
+
+		float4 Verts[3];
+		UNROLL
+		for( uint k = 0; k < 3; k++ )
+		{
+			MaterialShader.TransformedTri.Verts[k]	= TriangleVerts[k].TransformedVert;
+			Verts[k]								= TriangleVerts[k].PointSubpixelClip;
+		}
+
+		FRasterTri Tri = SetupTriangle< NANITE_SUBPIXEL_SAMPLES, !NANITE_TWO_SIDED >( Raster.ScissorRect, Verts );
+
+		if( Tri.bIsValid && bTriValid )
+		{
+			uint PixelValue = (VisibleIndex + 1) << 7;
+			PixelValue |= TriIndex;
+
+			uint2 VisualizeValues = GetVisualizeValues();
+
+		#if VIRTUAL_TEXTURE_TARGET && NANITE_LATE_VSM_PAGE_TRANSLATION
+			if (!Raster.bSinglePage)
+			{
+				// @lh-todo: Explicitly initialize structs with empty struct fields until DXC/SPIR-V can handle it properly
+				TNaniteWritePixel< FMaterialShader, FCachedPageTable > NaniteWritePixel;
+				NaniteWritePixel.Raster = Raster;
+				NaniteWritePixel.Shader = MaterialShader;
+				NaniteWritePixel.PixelValue = PixelValue;
+				NaniteWritePixel.VisualizeValues = VisualizeValues;
+				RasterizeTri_Adaptive( Tri, NaniteWritePixel );
+			}
+			else
+		#endif
+			{
+				// @lh-todo: Explicitly initialize structs with empty struct fields until DXC/SPIR-V can handle it properly
+				TNaniteWritePixel< FMaterialShader > NaniteWritePixel;
+				NaniteWritePixel.Raster = Raster;
+				NaniteWritePixel.Shader = MaterialShader;
+				NaniteWritePixel.PixelValue = PixelValue;
+				NaniteWritePixel.VisualizeValues = VisualizeValues;
+				RasterizeTri_Adaptive( Tri, NaniteWritePixel );
+			}
+		}
+	}
+
+#else
+	UNROLL
+	for( uint i = 0; i < VERTEX_CACHE_SIZE; i += THREADGROUP_SIZE )
+	{
+		const uint VertIndex = GroupThreadIndex + i;
+		
+		BRANCH
+		if (VertIndex >= Cluster.NumVerts)
+			break;
+
+		// Transform vertex and store in group shared memory.
+		FNanitePostDeformVertex InputVert = FetchAndDeformLocalNaniteVertex(PrimitiveData, InstanceData, Cluster, VertIndex, NANITE_NUM_TEXCOORDS_TO_DECODE);
+		float3 WorldPositionOffset = 0.0f;
+	#if NANITE_VERTEX_PROGRAMMABLE
+		BRANCH
+		if (bEvaluateWPO)
+		{
+			WorldPositionOffset = MaterialShader.EvaluateWorldPositionOffset(InputVert);
+		}
+	#endif
+
+		const float3 PointTranslatedWorld = mul( float4( InputVert.Position, 1 ), InstanceDynamicData.LocalToTranslatedWorld ).xyz + WorldPositionOffset;
+		const float4 PointClip = mul( float4( PointTranslatedWorld, 1 ), NaniteView.TranslatedWorldToClip );
+
+		GroupVerts[VertIndex] = CalculateSubpixelCoordinates( Raster, PointClip ).xyz;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	UNROLL
+	for( uint j = 0; j < NANITE_MAX_CLUSTER_TRIANGLES; j += THREADGROUP_SIZE )
+	{
+		const uint ThreadIndex = GroupThreadIndex + j;
+		const uint TriIndex = ThreadIndex + TriRange.Start;
+
+		uint3 VertIndexes = DecodeTriangleIndices(Cluster, TriIndex);
+		if( bReverseWindingOrder )
+			VertIndexes.yz = VertIndexes.zy;
+
+		float4 Verts[3];
+		Verts[0] = float4( GroupVerts[ VertIndexes.x ], 1 );
+		Verts[1] = float4( GroupVerts[ VertIndexes.y ], 1 );
+		Verts[2] = float4( GroupVerts[ VertIndexes.z ], 1 );
+
+		BRANCH
+		if (ThreadIndex >= TriRange.Num)
+			break;
+
+		FRasterTri Tri = SetupTriangle< NANITE_SUBPIXEL_SAMPLES, !NANITE_TWO_SIDED >( Raster.ScissorRect, Verts );
+		
+		if( Tri.bIsValid )
+		{
+			uint PixelValue = (VisibleIndex + 1) << 7;
+			PixelValue |= TriIndex;
+
+			uint2 VisualizeValues = GetVisualizeValues();
+
+		#if VIRTUAL_TEXTURE_TARGET && NANITE_LATE_VSM_PAGE_TRANSLATION
+			if (!Raster.bSinglePage)
+			{
+				// @lh-todo: Explicitly initialize structs with empty struct fields until DXC/SPIR-V can handle it properly
+				TNaniteWritePixel< FMaterialShader, FCachedPageTable > NaniteWritePixel;
+				NaniteWritePixel.Raster = Raster;
+				NaniteWritePixel.Shader = MaterialShader;
+				NaniteWritePixel.PixelValue = PixelValue;
+				NaniteWritePixel.VisualizeValues = VisualizeValues;
+				RasterizeTri_Adaptive( Tri, NaniteWritePixel );
+			}
+			else
+		#endif
+			{
+				// @lh-todo: Explicitly initialize structs with empty struct fields until DXC/SPIR-V can handle it properly
+				TNaniteWritePixel< FMaterialShader > NaniteWritePixel;
+				NaniteWritePixel.Raster = Raster;
+				NaniteWritePixel.Shader = MaterialShader;
+				NaniteWritePixel.PixelValue = PixelValue;
+				NaniteWritePixel.VisualizeValues = VisualizeValues;
+				RasterizeTri_Adaptive( Tri, NaniteWritePixel );
+			}
+		}
+	}
+#endif
+}
+
+void PatchRasterize( uint GroupID, uint GroupThreadIndex ) 
+{
+#if NANITE_TESSELLATION
+	if(GroupThreadIndex >= WaveGetLaneCount())	// Workaround for wave sizes smaller than 32
+	{
+		return;
+	}
+	const uint ThreadGroupSize	= min(THREADGROUP_SIZE, WaveGetLaneCount());
+	
+	const uint TotalPatches		= RasterBinMeta[ActiveRasterBin].BinSWCount;
+
+	const uint PatchStartIndex	= min(GroupID * MaxPatchesPerGroup, TotalPatches);
+	const uint PatchEndIndex	= min(PatchStartIndex + MaxPatchesPerGroup, TotalPatches);
+	const uint NumPatches		= PatchEndIndex - PatchStartIndex;
+	
+	// Stuff that gets calculated during the patch setup phase
+	uint4					Patches_EncodedPatch;
+	bool					Patches_bReverseWindingOrders;
+	FInstanceSceneData		Patches_InstanceData;
+	FInstanceDynamicData	Patches_InstanceDynamicData;
+	FSplitPatch				Patches_SplitPatch;
+	FTessellatedPatch		Patches_TessellatedPatch;
+	FNaniteVertTransforms	Patches_VertTransforms;
+	FNaniteTransformedVert	Patches_Verts;
+	float4					Patches_UVDensities;
+
+	if (GroupThreadIndex < NumPatches * 3u)
+	{
+		const uint LocalPatchIndex = GroupThreadIndex / 3u;
+		const uint PatchCornerIndex = GroupThreadIndex - LocalPatchIndex * 3u;
+
+		const uint PatchIndex = PatchStartIndex + LocalPatchIndex;
+		const uint PatchStartLane = LocalPatchIndex * 3;
+		
+		const uint4 RasterBin = FetchSWRasterBin(PatchIndex);
+		const uint VisibleIndex = RasterBin.x;
+
+#if NANITE_TESSELLATION_PATCH_REFS
+		const uint2 VisiblePatch = VisiblePatches.Load2(VisibleIndex * 8);
+		Patches_EncodedPatch = SplitWorkQueue.DataBuffer.Load4(VisiblePatch.x * 16);
+#if !NANITE_SEPARATE_SPLIT_QUEUE_CLEAR
+		DeviceMemoryBarrierWithGroupSync();
+		SplitWorkQueue.DataBuffer.Store4(VisiblePatch.x * 16, ~0u);
+#endif
+#else
+		Patches_EncodedPatch = VisiblePatches.Load4(VisibleIndex * 16);
+#endif
+
+		Patches_SplitPatch.Decode(Patches_EncodedPatch);
+		
+		const FVisibleCluster VisibleCluster = GetVisibleCluster(Patches_SplitPatch.VisibleClusterIndex, VIRTUAL_TEXTURE_TARGET);
+		const FCluster Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+
+		FPrimitiveSceneData PrimitiveData;
+		GetNaniteMaterialSceneData(VisibleCluster, PrimitiveData, Patches_InstanceData);
+
+		const FNaniteView NaniteView = GetNaniteView(VisibleCluster.ViewId);
+		
+#if NANITE_VERTEX_PROGRAMMABLE || NANITE_PIXEL_PROGRAMMABLE
+		ResolvedView = ResolveView(NaniteView);
+#endif
+
+		Patches_InstanceDynamicData = CalculateInstanceDynamicData(NaniteView, Patches_InstanceData);
+
+		Patches_bReverseWindingOrders = ReverseWindingOrder(NaniteView, PrimitiveData, Patches_InstanceData);
+
+#if NANITE_VERTEX_PROGRAMMABLE || NANITE_PIXEL_PROGRAMMABLE
+		Patches_VertTransforms = CalculateNaniteVertexTransforms(Patches_InstanceData, Patches_InstanceDynamicData, NaniteView);
+#endif
+
+#if ALWAYS_EVALUATE_WORLD_POSITION_OFFSET
+		const bool bEvaluateWPO = true;
+#else
+		const bool bEvaluateWPO = (VisibleCluster.Flags & NANITE_CULLING_FLAG_ENABLE_WPO) != 0;
+#endif
+
+		const uint3 VertIndexes = DecodeTriangleIndices(Cluster, Patches_SplitPatch.TriIndex);
+		Patches_Verts = FetchTransformedNaniteVertex(PrimitiveData, Patches_InstanceData, Patches_VertTransforms, Cluster, VertIndexes[PatchCornerIndex], bEvaluateWPO);
+
+		Patches_UVDensities = GetMaterialUVDensities(Cluster, Patches_InstanceData.PrimitiveId, Patches_SplitPatch.TriIndex);
+
+#if NANITE_TESSELLATION_PATCH_REFS
+		Patches_TessellatedPatch.Init(VisiblePatch.y, false);
+#else
+		
+		const float3 OuterPatchCornersView = mul(float4(Patches_Verts.PointWorld, 1), NaniteView.TranslatedWorldToView).xyz;
+		
+		const float3 InnerPatchCornersView =	WaveReadLaneAt(OuterPatchCornersView, PatchStartLane + 0) * Patches_SplitPatch.Barycentrics[PatchCornerIndex].x +
+												WaveReadLaneAt(OuterPatchCornersView, PatchStartLane + 1) * Patches_SplitPatch.Barycentrics[PatchCornerIndex].y +
+												WaveReadLaneAt(OuterPatchCornersView, PatchStartLane + 2) * Patches_SplitPatch.Barycentrics[PatchCornerIndex].z;
+
+		float3 CornersView[3];
+		CornersView[0] = WaveReadLaneAt(InnerPatchCornersView, PatchStartLane + 0);
+		CornersView[1] = WaveReadLaneAt(InnerPatchCornersView, PatchStartLane + 1);
+		CornersView[2] = WaveReadLaneAt(InnerPatchCornersView, PatchStartLane + 2);
+		
+		const float3 TessFactors = GetTessFactors(NaniteView, CornersView);
+		Patches_TessellatedPatch.Init(TessFactors, Patches_EncodedPatch.yzw, false);
+		Patches_SplitPatch.Decode(Patches_EncodedPatch);
+#endif
+	}
+
+	for (uint i = 0; i < NumPatches; i++)
+	{
+		const uint PatchStartLane						= i * 3;
+		
+		// Read values from patch setup
+		const bool bReverseWindingOrder					= WaveReadLaneAt(Patches_bReverseWindingOrders, PatchStartLane);
+		const FSplitPatch SplitPatch					= WaveReadLaneAt(Patches_SplitPatch, PatchStartLane);
+		const FTessellatedPatch TessellatedPatch		= WaveReadLaneAt(Patches_TessellatedPatch, PatchStartLane);
+		const float4 UVDensities						= WaveReadLaneAt(Patches_UVDensities, PatchStartLane);
+				
+		// The following values can be used in a shader, but will most likely be dead code eliminated
+		const FInstanceSceneData InstanceData			= WaveReadLaneAt(Patches_InstanceData, PatchStartLane);
+		const FInstanceDynamicData InstanceDynamicData	= WaveReadLaneAt(Patches_InstanceDynamicData, PatchStartLane);
+		const FNaniteVertTransforms	VertTransforms		= WaveReadLaneAt(Patches_VertTransforms, PatchStartLane);
+
+	#if VISUALIZE
+		const uint4 PatchEncoded						= WaveReadLaneAt(Patches_EncodedPatch, PatchStartLane);
+	#endif
+		
+		const FVisibleCluster VisibleCluster			= GetVisibleCluster(SplitPatch.VisibleClusterIndex, VIRTUAL_TEXTURE_TARGET);
+		const FCluster Cluster							= GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+		
+		const FNaniteView NaniteView					= GetNaniteView(VisibleCluster.ViewId);
+#if NANITE_VERTEX_PROGRAMMABLE || NANITE_PIXEL_PROGRAMMABLE
+		ResolvedView = ResolveView(NaniteView);
+#endif
+
+		FMaterialShader MaterialShader;
+
+#if NANITE_VERTEX_PROGRAMMABLE || NANITE_PIXEL_PROGRAMMABLE
+		MaterialShader.InstanceData = InstanceData;
+		MaterialShader.InstanceDynamicData = InstanceDynamicData;
+		MaterialShader.NaniteView = NaniteView;
+		MaterialShader.Cluster = Cluster;
+		MaterialShader.VertTransforms = VertTransforms;
+#endif
+		MaterialShader.TransformedTri = MakeTransformedNaniteTriangle(Patches_Verts, PatchStartLane + uint3(0, 1, 2));
+
+#if USES_DISPLACEMENT
+		MaterialShader.DisplacementCenter = RasterBinMeta[ActiveRasterBin].MaterialDisplacementCenter;
+		MaterialShader.DisplacementMagnitude = RasterBinMeta[ActiveRasterBin].MaterialDisplacementMagnitude;
+#endif
+
+		uint PixelValue = (SplitPatch.VisibleClusterIndex + 1) << 7;
+
+		uint NumVerts = TessellatedPatch.GetNumVerts();
+		uint NumTris = TessellatedPatch.GetNumTris();
+
+		FRaster Raster = CreateRaster( NaniteView, InstanceData, VisibleCluster );
+
+		GroupMemoryBarrierWithGroupSync();
+
+	#if VIRTUAL_TEXTURE_TARGET && NANITE_LATE_VSM_PAGE_TRANSLATION
+		if (!Raster.bSinglePage)
+		{
+			for (uint Offset = 0; Offset < NANITE_VSM_PAGE_TABLE_CACHE_DIM * NANITE_VSM_PAGE_TABLE_CACHE_DIM; Offset += ThreadGroupSize)
+			{
+				FetchAndCachePageTableEntry(NaniteView, VisibleCluster.vPage, VisibleCluster.vPageEnd, Offset + GroupThreadIndex);
+			}
+			GroupMemoryBarrierWithGroupSync();
+		}
+	#endif
+
+		for( uint VertIndex = GroupThreadIndex; VertIndex < NumVerts; VertIndex += ThreadGroupSize )
+		{
+			FBarycentrics Barycentrics;
+			Barycentrics.Value	= TessellatedPatch.GetVert( VertIndex );
+			Barycentrics.Value_dx	= 0;//float3( -1, 1, 0 ) / TessFactors.x;
+			Barycentrics.Value_dy	= 0;//float3( 0, -1, 1 ) / TessFactors.y;
+	
+			Barycentrics = SplitPatch.TransformBarycentrics( Barycentrics );
+
+			GroupVerts[ VertIndex ] = CalculateSubpixelCoordinates( Raster, MaterialShader.EvaluateDomain( UVDensities, Barycentrics ) ).xyz;
+		}
+	
+		GroupMemoryBarrierWithGroupSync();
+
+		for( uint TriIndex = GroupThreadIndex; TriIndex < NumTris; TriIndex += ThreadGroupSize )
+		{
+			uint3 VertIndexes = TessellatedPatch.GetIndexes( TriIndex );
+
+			if( bReverseWindingOrder )
+				VertIndexes.yz = VertIndexes.zy;
+
+			float4 Verts[3];
+			Verts[0] = float4( GroupVerts[ VertIndexes.x ], 1 );
+			Verts[1] = float4( GroupVerts[ VertIndexes.y ], 1 );
+			Verts[2] = float4( GroupVerts[ VertIndexes.z ], 1 );
+	
+			FRasterTri Tri = SetupTriangle< NANITE_SUBPIXEL_SAMPLES, !NANITE_TWO_SIDED >( Raster.ScissorRect, Verts );
+
+			if( max3( Verts[0].z, Verts[1].z, Verts[2].z ) > 1 )
+				Tri.bIsValid = false;
+	
+			if( Tri.bIsValid )
+			{
+			#if VISUALIZE
+				const uint SubPatch = (Rand3DPCG32(PatchEncoded.yzw).x & 0xff0000u) >> 16u;
+				const uint MicroTri = TriIndex & 0xffu;
+				const uint2 VisualizeValues = GetVisualizeValues(1u /* AddValue */, SubPatch, MicroTri);
+			#else
+				const uint2 VisualizeValues = uint2(0, 0);
+			#endif
+
+				RasterizeDicedTri(
+					Tri,
+					Raster,
+					MaterialShader,
+					PixelValue | SplitPatch.TriIndex,
+					VisualizeValues );
+			}
+		}
+	}
+#endif
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MicropolyRasterize(
+	uint DispatchThreadID	: SV_DispatchThreadID,
+	uint GroupID			: SV_GroupID,
+	uint GroupIndex			: SV_GroupIndex) 
+{
+#if PATCHES
+	PatchRasterize( GroupID, GroupIndex );
+#else
+	ClusterRasterize( GroupID, GroupIndex );
+#endif
+}
+
+
+#define VERTEX_TO_TRIANGLE_MASKS			(NANITE_PRIM_SHADER && (!DEPTH_ONLY || NANITE_PIXEL_PROGRAMMABLE))
+
+#ifndef NANITE_ALLOW_SV_BARYCENTRICS
+#define NANITE_ALLOW_SV_BARYCENTRICS 1
+#endif
+
+// Use barycentric intrinsics when available, otherwise prefer SV_Barycentrics.
+// If all else fails export them explicitly (incompatible with vertex reuse).
+#define BARYCENTRIC_MODE_NONE				(!NANITE_PIXEL_PROGRAMMABLE)
+#define BARYCENTRIC_MODE_INTRINSICS			(!BARYCENTRIC_MODE_NONE && (NANITE_MESH_SHADER || NANITE_PRIM_SHADER) && COMPILER_SUPPORTS_BARYCENTRIC_INTRINSICS)
+#define BARYCENTRIC_MODE_SV_BARYCENTRICS	(!BARYCENTRIC_MODE_NONE && NANITE_MESH_SHADER && NANITE_ALLOW_SV_BARYCENTRICS && !COMPILER_SUPPORTS_BARYCENTRIC_INTRINSICS)
+#define BARYCENTRIC_MODE_EXPORT				(!BARYCENTRIC_MODE_NONE && !BARYCENTRIC_MODE_INTRINSICS && !BARYCENTRIC_MODE_SV_BARYCENTRICS)
+
+struct VSOut
+{
+#if NANITE_HW_RASTER_INTERPOLATE_DEPTH
+	float2 ClipZW								: TEXCOORD0;
+#endif
+
+	nointerpolation uint3 PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset : TEXCOORD1;
+	nointerpolation int4 ViewRect				: TEXCOORD2;
+#if VERTEX_TO_TRIANGLE_MASKS
+#if NANITE_VERT_REUSE_BATCH
+	CUSTOM_INTERPOLATION uint2 ToTriangleMask_TriRangeStart : TEXCOORD3;
+#else
+	CUSTOM_INTERPOLATION uint4 ToTriangleMasks	: TEXCOORD3;
+#endif
+#endif
+
+#if BARYCENTRIC_MODE_INTRINSICS
+	CUSTOM_INTERPOLATION uint VertexID			: TEXCOORD4;
+#elif BARYCENTRIC_MODE_SV_BARYCENTRICS && PIXELSHADER
+	float3 Barycentrics							: SV_Barycentrics;
+#elif BARYCENTRIC_MODE_EXPORT
+	float2 BarycentricsUV						: TEXCOORD4;
+#endif
+
+#if NANITE_PIXEL_PROGRAMMABLE
+	float4 TexCoords							: TEXCOORD5;
+#endif
+
+	float4 Position								: SV_Position;
+
+#if USE_GLOBAL_CLIP_PLANE && !PIXELSHADER
+	float OutGlobalClipPlaneDistance			: SV_ClipDistance;
+#endif
+};
+
+#if NANITE_MESH_SHADER
+struct PrimitiveAttributes
+{
+	// Use uint4 to prevent compiler from erroneously packing per-vertex and per-prim attributes together
+	// .x = Cluster Index
+	// .y = Triangle Index
+	// .z = View Width
+	// .w = View Height
+	nointerpolation uint4 PackedData : TEXCOORD7;
+};
+#endif
+
+VSOut CommonRasterizerVS(FNaniteView NaniteView, FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FVisibleCluster VisibleCluster, FCluster Cluster, uint VertIndex, uint PixelValue, bool bReverseWindingOrder)
+{
+	VSOut Out;
+
+	const FNanitePostDeformVertex InputVert = FetchAndDeformLocalNaniteVertex(PrimitiveData, InstanceData, Cluster, VertIndex, NANITE_NUM_TEXCOORDS_TO_DECODE);
+
+	float3 WorldPositionOffset = 0.0f;
+#if NANITE_VERTEX_PROGRAMMABLE
+	FMaterialShader MaterialShader;
+	MaterialShader.InstanceData			= InstanceData;
+	MaterialShader.InstanceDynamicData	= CalculateInstanceDynamicData(NaniteView, InstanceData);
+	MaterialShader.NaniteView			= NaniteView;
+	MaterialShader.Cluster 				= Cluster;
+
+#if NANITE_TESSELLATION && USES_DISPLACEMENT
+	MaterialShader.DisplacementCenter		= RasterBinMeta[ActiveRasterBin].MaterialDisplacementCenter;
+	MaterialShader.DisplacementMagnitude	= RasterBinMeta[ActiveRasterBin].MaterialDisplacementMagnitude;
+#endif
+
+	WorldPositionOffset = MaterialShader.EvaluateWorldPositionOffset(InputVert);
+#endif
+	
+	const float3 PointTranslatedWorld = DFTransformLocalToTranslatedWorld(InputVert.Position, InstanceData.LocalToWorld, NaniteView.PreViewTranslation) + WorldPositionOffset;
+	float4 PointClip = mul( float4( PointTranslatedWorld, 1 ), NaniteView.TranslatedWorldToClip );
+#if VIRTUAL_TEXTURE_TARGET
+	/*
+	float2 vUV = PointClip.xy * float2(0.5, -0.5) + 0.5 * PointClip.w;
+	float2 vPixels = vUV * NaniteView.ViewSizeAndInvSize.xy;
+	float2 LocalPixels = vPixels - VisibleCluster.vPage * VSM_PAGE_SIZE * PointClip.w;
+	float2 LocalUV = LocalPixels / ( 4 * VSM_PAGE_SIZE );
+	float2 LocalClip = LocalUV * float2(2, -2) + float2(-1, 1) * PointClip.w;
+	PointClip.xy = LocalClip;
+	*/
+	PointClip.xy = NaniteView.ClipSpaceScaleOffset.xy * PointClip.xy + NaniteView.ClipSpaceScaleOffset.zw * PointClip.w;
+
+	// Offset 0,0 to be at vPage for a 0, VSM_PAGE_SIZE * VSM_RASTER_WINDOW_PAGES viewport.
+	PointClip.xy += PointClip.w * ( float2(-2, 2) / VSM_RASTER_WINDOW_PAGES ) * VisibleCluster.vPage;
+
+	Out.ViewRect.xy = VisibleCluster.vPage * VSM_PAGE_SIZE;
+	Out.ViewRect.zw = VisibleCluster.vPageEnd * VSM_PAGE_SIZE + VSM_PAGE_SIZE;
+#else
+	PointClip.xy = NaniteView.ClipSpaceScaleOffset.xy * PointClip.xy + NaniteView.ClipSpaceScaleOffset.zw * PointClip.w;
+	Out.ViewRect = NaniteView.ViewRect;
+#endif
+
+	Out.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset = uint3(PixelValue, VisibleCluster.ViewId, 0u);
+
+#if BARYCENTRIC_MODE_SV_BARYCENTRICS || BARYCENTRIC_MODE_EXPORT
+	// Set SwapVW flag to indicate that the V and W barycentrics need to be swapped in the PS to compensate for the swapping of the i1 and i2 vertices.
+	// BARYCENTRIC_MODE_EXPORT doesn't need this as it compensates by flipping the exported barycentrics instead.
+	Out.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.y |= (bReverseWindingOrder ? (1u << 16) : 0u);
+#endif
+
+#if NANITE_PIXEL_PROGRAMMABLE
+	Out.TexCoords.xy = InputVert.RawAttributeData.TexCoords[0];
+	Out.TexCoords.zw = InputVert.RawAttributeData.TexCoords[1];
+#endif
+
+#if VIRTUAL_TEXTURE_TARGET
+	const bool bCacheAsStatic = (VisibleCluster.Flags & NANITE_CULLING_FLAG_CACHE_AS_STATIC) != 0u;
+	const uint ArrayIndex = bCacheAsStatic ? GetVirtualShadowMapStaticArrayIndex() : 0;
+	Out.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.y |= (NaniteView.TargetMipLevel << 18) | (ArrayIndex << 23);
+	Out.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.z = CalcPageTableLevelOffset(NaniteView.TargetLayerIndex, NaniteView.TargetMipLevel).LevelOffset;
+#endif
+
+#if !PIXELSHADER
+	Out.Position = PointClip;
+
+#if NANITE_HW_RASTER_INTERPOLATE_DEPTH
+	Out.ClipZW = PointClip.zw;
+#endif
+
+	const bool bNearClip = ((NaniteView.Flags & NANITE_VIEW_FLAG_NEAR_CLIP) != 0u);
+	if (!bNearClip)
+	{
+		// Shader workaround to avoid HW depth clipping. Should be replaced with rasterizer state ideally.
+		Out.Position.z = 0.5f * Out.Position.w;
+	}
+#endif
+
+#if BARYCENTRIC_MODE_INTRINSICS
+	Out.VertexID = VertIndex;
+#endif
+
+#if USE_GLOBAL_CLIP_PLANE && !PIXELSHADER
+	Out.OutGlobalClipPlaneDistance = GetGlobalClipPlaneDistance(NaniteView, PointTranslatedWorld);
+#endif
+
+	return Out;
+}
+
+#if NANITE_PRIM_SHADER
+
+#pragma argument(realtypes)
+
+struct PrimitiveInput
+{
+	uint Index		: PRIM_SHADER_SEM_VERT_INDEX;
+#if !NANITE_VERT_REUSE_BATCH
+	uint WaveIndex	: PRIM_SHADER_SEM_WAVE_INDEX;
+#endif
+};
+
+struct PrimitiveOutput
+{
+	VSOut Out;
+
+	uint PrimExport	: PRIM_SHADER_SEM_PRIM_EXPORT;
+	uint VertCount	: PRIM_SHADER_SEM_VERT_COUNT;
+	uint PrimCount	: PRIM_SHADER_SEM_PRIM_COUNT;
+};
+
+uint PackTriangleExport(uint3 TriangleIndices)
+{
+	return TriangleIndices.x | (TriangleIndices.y << 10) | (TriangleIndices.z << 20);
+}
+
+uint3 UnpackTriangleExport(uint Packed)
+{
+	const uint Index0 = (Packed & 0x3FF);
+	const uint Index1 = (Packed >> 10) & 0x3FF;
+	const uint Index2 = (Packed >> 20);
+	return uint3(Index0, Index1, Index2);
+}
+
+#define NUM_VERTEX_MASKS ((NANITE_MAX_CLUSTER_VERTICES + 31)/32)
+
+groupshared union
+{
+#if VERTEX_TO_TRIANGLE_MASKS
+	uint VertexToTriangleMasks[NANITE_MAX_CLUSTER_VERTICES][4];
+#endif
+	struct
+	{
+		uint ClusterIndex;			// NOTE: Overlapping ClusterIndex with VertexToTriangleMasks reduces peak LDS usage because of allocation granularity.
+		uint ReferencedVerticesMasks[NUM_VERTEX_MASKS];
+		uint ReferencedVerticesPrefixSums[NUM_VERTEX_MASKS];
+		uchar NewToOldVertex[NANITE_MAX_CLUSTER_VERTICES];
+		uchar OldToNewVertex[NANITE_MAX_CLUSTER_VERTICES];
+	} S;
+} LDS;
+
+groupshared uint GroupVertToTriMasks[32];
+
+PRIM_SHADER_OUTPUT_TRIANGLES
+PRIM_SHADER_PRIM_COUNT(1)
+PRIM_SHADER_VERT_COUNT(1)
+#if NANITE_VERT_REUSE_BATCH
+PRIM_SHADER_VERT_LIMIT(32)
+PRIM_SHADER_AMP_FACTOR(32)
+#else
+PRIM_SHADER_VERT_LIMIT(256)
+PRIM_SHADER_AMP_FACTOR(128)
+#endif
+PRIM_SHADER_AMP_ENABLE
+PrimitiveOutput HWRasterizeVS(PrimitiveInput Input)
+{
+	const uint LaneIndex = WaveGetLaneIndex();
+	const uint LaneCount = WaveGetLaneCount();
+
+#if NANITE_VERT_REUSE_BATCH
+	const uint GroupThreadID = LaneIndex;
+	uint VisibleIndex = WaveReadLaneAt(Input.Index, 0);
+#else
+	const uint GroupThreadID = LaneIndex + Input.WaveIndex * LaneCount;
+
+	if (GroupThreadID == 0)
+	{
+		// Input index is only initialized for lane 0, so we need to manually communicate it to all other threads in subgroup (not just wavefront).
+		LDS.S.ClusterIndex = Input.Index;
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+	uint VisibleIndex = LDS.S.ClusterIndex;
+#endif
+
+	FTriRange TriRange = GetIndexAndTriRangeHW( VisibleIndex );
+
+	// Should be all scalar.
+	FVisibleCluster VisibleCluster = GetVisibleCluster( VisibleIndex, VIRTUAL_TEXTURE_TARGET );
+	
+	FPrimitiveSceneData PrimitiveData;
+	FInstanceSceneData InstanceData;
+	GetNaniteMaterialSceneData(VisibleCluster, PrimitiveData, InstanceData);
+	
+	FNaniteView NaniteView = GetNaniteView( VisibleCluster.ViewId );
+	const bool bReverseWindingOrder = ReverseWindingOrder(NaniteView, PrimitiveData, InstanceData);
+
+#if NANITE_VERTEX_PROGRAMMABLE
+	ResolvedView = ResolveView(NaniteView);
+#endif
+
+	FCluster Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+	if( TriRange.Num == 0 )
+		TriRange.Num = Cluster.NumTris;
+
+#if NANITE_VERT_REUSE_BATCH
+#if VERTEX_TO_TRIANGLE_MASKS
+	GroupVertToTriMasks[GroupThreadID] = 0;
+#endif
+	
+	const uint TriIndex = TriRange.Start + GroupThreadID;
+	
+	bool bTriValid = GroupThreadID < TriRange.Num;
+
+	uint3 VertIndexes = 0;
+	if (bTriValid)
+	{
+		VertIndexes = DecodeTriangleIndices(Cluster, TriIndex);
+
+		if( bReverseWindingOrder )
+			VertIndexes.yz = VertIndexes.zy;
+	}
+
+	uint NumUniqueVerts;
+	uint3 VertLaneIndexes;
+	uint LaneVertIndex;
+	DeduplicateVertIndexes(VertIndexes, GroupThreadID, bTriValid, NumUniqueVerts, LaneVertIndex, VertLaneIndexes);
+
+	PrimitiveOutput PrimOutput;
+	PrimOutput.VertCount = NumUniqueVerts;
+	PrimOutput.PrimCount = TriRange.Num;
+
+	if (GroupThreadID < NumUniqueVerts)
+	{
+		const uint PixelValue = (VisibleIndex + 1) << 7;
+		PrimOutput.Out = CommonRasterizerVS(NaniteView, PrimitiveData, InstanceData, VisibleCluster, Cluster, LaneVertIndex, PixelValue, bReverseWindingOrder);
+	}
+
+	if (bTriValid)
+	{
+		PrimOutput.PrimExport = PackTriangleExport(VertLaneIndexes);
+	}
+
+#if VERTEX_TO_TRIANGLE_MASKS
+	if (bTriValid)
+	{
+		InterlockedOr(GroupVertToTriMasks[VertLaneIndexes.x], 1 << GroupThreadID);
+		InterlockedOr(GroupVertToTriMasks[VertLaneIndexes.y], 1 << GroupThreadID);
+		InterlockedOr(GroupVertToTriMasks[VertLaneIndexes.z], 1 << GroupThreadID);
+	}
+
+	GroupMemoryBarrier();
+
+	if (GroupThreadID < NumUniqueVerts)
+	{
+		PrimOutput.Out.ToTriangleMask_TriRangeStart = uint2(GroupVertToTriMasks[GroupThreadID], TriRange.Start);
+	}
+#endif
+
+#else // !NANITE_VERT_REUSE_BATCH
+	uint NumExportVertices  = Cluster.NumVerts;
+	bool bNeedsCompaction = (TriRange.Num != Cluster.NumTris);
+
+	uint SrcVertexIndex = GroupThreadID;
+	uint3 VertIndexes;
+	if (GroupThreadID < TriRange.Num)
+	{
+		VertIndexes = DecodeTriangleIndices(Cluster, TriRange.Start + GroupThreadID);
+		if( bReverseWindingOrder )
+			VertIndexes.yz = VertIndexes.zy;
+	}
+
+	BRANCH
+	if (bNeedsCompaction)
+	{
+		// Programmable raster renders a single material at a time, so clusters with multiple materials need to only
+		// export triangles from the current material. Unreferenced vertices are not allowed in primitive shaders,
+		// so we need to compact the vertices and remap any references.
+		
+		// The expectation is that this path is going to be rare as most clusters will have just a single material and
+		// most materials will not need programmable raster.
+
+		if (GroupThreadID < NUM_VERTEX_MASKS)
+		{
+			// Clear vertex reference masks
+			LDS.S.ReferencedVerticesMasks[GroupThreadID] = 0u;
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if (GroupThreadID < TriRange.Num)
+		{
+			// Mark referenced vertices
+			InterlockedOr(LDS.S.ReferencedVerticesMasks[VertIndexes.x >> 5], 1u << (VertIndexes.x & 31));
+			InterlockedOr(LDS.S.ReferencedVerticesMasks[VertIndexes.y >> 5], 1u << (VertIndexes.y & 31));
+			InterlockedOr(LDS.S.ReferencedVerticesMasks[VertIndexes.z >> 5], 1u << (VertIndexes.z & 31));
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+		if (GroupThreadID < NUM_VERTEX_MASKS)
+		{
+			// Calculate dword prefix sums
+			const uint NumMaskBits = countbits(LDS.S.ReferencedVerticesMasks[GroupThreadID]);
+			LDS.S.ReferencedVerticesPrefixSums[GroupThreadID] = WavePrefixSum(NumMaskBits);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Update export vertices to number of referenced vertices
+		NumExportVertices = LDS.S.ReferencedVerticesPrefixSums[NUM_VERTEX_MASKS - 1] + countbits(LDS.S.ReferencedVerticesMasks[NUM_VERTEX_MASKS - 1]);
+
+		if (GroupThreadID < Cluster.NumVerts)
+		{
+			const uint DwordIndex = GroupThreadID >> 5;
+			const uint BitIndex = GroupThreadID & 31;
+			if (LDS.S.ReferencedVerticesMasks[DwordIndex] & (1u << BitIndex))
+			{
+				// Fill mappings between old and new (compact) vertex indices
+				const uint NewVertexIndex = LDS.S.ReferencedVerticesPrefixSums[DwordIndex] + countbits(BitFieldExtractU32(LDS.S.ReferencedVerticesMasks[DwordIndex], BitIndex, 0));
+				LDS.S.OldToNewVertex[GroupThreadID] = (uchar)NewVertexIndex;
+				LDS.S.NewToOldVertex[NewVertexIndex] = (uchar)GroupThreadID;
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+		if (GroupThreadID < TriRange.Num)
+		{
+			// Remap triangles to new vertex indices
+			VertIndexes = uint3(LDS.S.OldToNewVertex[VertIndexes.x], LDS.S.OldToNewVertex[VertIndexes.y], LDS.S.OldToNewVertex[VertIndexes.z]);
+		}
+		if (GroupThreadID < NumExportVertices)
+		{
+			// Remap source vertex from compact to old
+			SrcVertexIndex = LDS.S.NewToOldVertex[GroupThreadID];
+		}
+	}
+
+	PrimitiveOutput PrimOutput;
+	PrimOutput.VertCount = NumExportVertices;
+	PrimOutput.PrimCount = TriRange.Num;
+
+	if (GroupThreadID < TriRange.Num)
+	{
+		PrimOutput.PrimExport = PackTriangleExport(VertIndexes);
+	}
+
+	if (GroupThreadID < NumExportVertices)
+	{
+		const uint PixelValue = ((VisibleIndex + 1) << 7);
+		PrimOutput.Out = CommonRasterizerVS(NaniteView, PrimitiveData, InstanceData, VisibleCluster, Cluster, SrcVertexIndex, PixelValue, bReverseWindingOrder);
+	}
+
+#if VERTEX_TO_TRIANGLE_MASKS
+	GroupMemoryBarrierWithGroupSync();	// Sync to make sure there is no lifetime overlap with LDS.S
+
+	if (GroupThreadID < NumExportVertices)
+	{
+		LDS.VertexToTriangleMasks[GroupThreadID][0] = 0;
+		LDS.VertexToTriangleMasks[GroupThreadID][1] = 0;
+		LDS.VertexToTriangleMasks[GroupThreadID][2] = 0;
+		LDS.VertexToTriangleMasks[GroupThreadID][3] = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	if (GroupThreadID < TriRange.Num)
+	{
+		const uint TriangleID = TriRange.Start + GroupThreadID;
+		const uint DwordIndex = (TriangleID >> 5) & 3;
+		const uint TriangleMask = 1 << (TriangleID & 31);
+		InterlockedOr(LDS.VertexToTriangleMasks[VertIndexes.x][DwordIndex], TriangleMask);
+		InterlockedOr(LDS.VertexToTriangleMasks[VertIndexes.y][DwordIndex], TriangleMask);
+		InterlockedOr(LDS.VertexToTriangleMasks[VertIndexes.z][DwordIndex], TriangleMask);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	if (GroupThreadID < NumExportVertices)
+	{
+		PrimOutput.Out.ToTriangleMasks = uint4(	LDS.VertexToTriangleMasks[GroupThreadID][0],
+												LDS.VertexToTriangleMasks[GroupThreadID][1],
+												LDS.VertexToTriangleMasks[GroupThreadID][2],
+												LDS.VertexToTriangleMasks[GroupThreadID][3]);
+	}
+#endif
+#endif // NANITE_VERT_REUSE_BATCH
+	
+	return PrimOutput;
+}
+
+#elif NANITE_MESH_SHADER
+
+#if MESHSHADER
+
+MESH_SHADER_TRIANGLE_ATTRIBUTES(NANITE_MESH_SHADER_TG_SIZE)
+void HWRasterizeMS(
+	uint GroupThreadID : SV_GroupThreadID,
+	uint3 GroupID : SV_GroupID,
+#if NANITE_VERT_REUSE_BATCH
+	MESH_SHADER_VERTEX_EXPORT(VSOut, 32),
+	MESH_SHADER_TRIANGLE_EXPORT(32),
+	MESH_SHADER_PRIMITIVE_EXPORT(PrimitiveAttributes, 32)
+#else
+	MESH_SHADER_VERTEX_EXPORT(VSOut, 256),
+	MESH_SHADER_TRIANGLE_EXPORT(128),
+	MESH_SHADER_PRIMITIVE_EXPORT(PrimitiveAttributes, 128)
+#endif
+)
+{
+	bool bValidIndex = true;
+
+#if PLATFORM_REQUIRES_UNWRAPPED_MESH_SHADER_ARGS
+	uint VisibleIndex = GroupID.x;
+#else
+	// Avoid overflowing the 64k limit on single dimension of SV_GroupID
+	uint VisibleIndex = GetUnWrappedDispatchGroupId(GroupID);
+	BRANCH
+	if (GroupID.y > 0 || GroupID.z > 0)
+	{
+		// Due to wrapping, the visible index can be out of range
+		bValidIndex = (VisibleIndex < RasterBinMeta[ActiveRasterBin].BinHWCount);
+	}
+#endif
+
+	// NOTE: Doing a simple early out here doesn't work. Likely because divergent control
+	// flow is not allowed around SetMeshOutputCounts, even if the condition is uniform for
+	// the group. The compiler succeeds but corruption occurs.
+
+	FTriRange TriRange;
+	FVisibleCluster VisibleCluster;
+	FInstanceSceneData InstanceData;
+	FPrimitiveSceneData PrimitiveData;
+	FNaniteView NaniteView;
+
+	uint NumUniqueVerts = 0;
+	uint3 VertIndexes = 0;
+	TriRange.Num = 0;
+	uint TriIndex = 0;
+	FCluster Cluster;
+	uint LaneVertIndex = 0;
+	bool bReverseWindingOrder = false;
+
+	BRANCH
+	if (bValidIndex)
+	{
+		TriRange = GetIndexAndTriRangeHW(VisibleIndex);
+		VisibleCluster = GetVisibleCluster(VisibleIndex, VIRTUAL_TEXTURE_TARGET);
+		GetNaniteMaterialSceneData(VisibleCluster, PrimitiveData, InstanceData);
+		NaniteView = GetNaniteView(VisibleCluster.ViewId);
+		bReverseWindingOrder = ReverseWindingOrder(NaniteView, PrimitiveData, InstanceData);
+
+	#if NANITE_VERTEX_PROGRAMMABLE
+		ResolvedView = ResolveView(NaniteView);
+	#endif
+
+		Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+		if( TriRange.Num == 0 )
+			TriRange.Num = Cluster.NumTris;
+
+		TriIndex = TriRange.Start + GroupThreadID;
+
+		bool bTriValid = GroupThreadID < TriRange.Num;
+
+		if (bTriValid)
+		{
+			VertIndexes = DecodeTriangleIndices(Cluster, TriIndex);
+		
+			if( bReverseWindingOrder )
+				VertIndexes.yz = VertIndexes.zy;
+		}
+
+	#if NANITE_VERT_REUSE_BATCH
+		DeduplicateVertIndexes(VertIndexes, GroupThreadID, bTriValid, NumUniqueVerts, LaneVertIndex, VertIndexes);
+	#else
+		LaneVertIndex = GroupThreadID;
+		NumUniqueVerts = Cluster.NumVerts;
+	#endif
+	}
+
+	SetMeshOutputCounts(NumUniqueVerts, TriRange.Num);
+
+	BRANCH
+	if (bValidIndex)
+	{
+		uint PrimExportIndex = GroupThreadID;
+		if (PrimExportIndex < TriRange.Num)
+		{
+			MESH_SHADER_WRITE_TRIANGLE(PrimExportIndex, VertIndexes);
+
+			PrimitiveAttributes Attributes;
+			Attributes.PackedData.x = VisibleIndex;
+			Attributes.PackedData.y = TriIndex;
+			Attributes.PackedData.z = asuint(NaniteView.ViewSizeAndInvSize.x);
+			Attributes.PackedData.w = asuint(NaniteView.ViewSizeAndInvSize.y);
+			MESH_SHADER_WRITE_PRIMITIVE(PrimExportIndex, Attributes);
+		}
+
+		uint VertExportIndex = GroupThreadID;
+		if (VertExportIndex < Cluster.NumVerts)
+		{
+			VSOut VertexOutput = CommonRasterizerVS(NaniteView, PrimitiveData, InstanceData, VisibleCluster, Cluster, LaneVertIndex, 0u, bReverseWindingOrder);
+			MESH_SHADER_WRITE_VERTEX(VertExportIndex, VertexOutput);
+		}
+
+	#if NANITE_MESH_SHADER_TG_SIZE == 128
+		VertExportIndex += 128;
+		if (VertExportIndex < Cluster.NumVerts)
+		{
+			VSOut VertexOutput = CommonRasterizerVS(NaniteView, PrimitiveData, InstanceData, VisibleCluster, Cluster, LaneVertIndex + 128, 0u, bReverseWindingOrder);
+			MESH_SHADER_WRITE_VERTEX(VertExportIndex, VertexOutput);
+		}
+	#endif
+	}
+}
+
+#endif // MESHSHADER
+
+#else // NANITE_MESH_SHADER / NANITE_PRIM_SHADER
+
+VSOut HWRasterizeVS(
+	uint VertexID		: SV_VertexID,
+	uint VisibleIndex	: SV_InstanceID
+	)
+{
+	FTriRange TriRange = GetIndexAndTriRangeHW( VisibleIndex );
+
+	uint LocalTriIndex = VertexID / 3;
+	VertexID = VertexID - LocalTriIndex * 3;
+
+	VSOut Out;
+#if !PIXELSHADER
+	Out.Position = float4(0,0,0,1);
+#endif
+
+	FVisibleCluster VisibleCluster = GetVisibleCluster( VisibleIndex, VIRTUAL_TEXTURE_TARGET );
+	
+	FPrimitiveSceneData PrimitiveData;
+	FInstanceSceneData InstanceData;
+	GetNaniteMaterialSceneData(VisibleCluster, PrimitiveData, InstanceData);
+
+	FNaniteView NaniteView = GetNaniteView( VisibleCluster.ViewId );
+	const bool bReverseWindingOrder = ReverseWindingOrder(NaniteView, PrimitiveData, InstanceData);
+
+#if NANITE_VERTEX_PROGRAMMABLE
+	ResolvedView = ResolveView(NaniteView);
+#endif
+
+	FCluster Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+	if( TriRange.Num == 0 )
+		TriRange.Num = Cluster.NumTris;
+
+	BRANCH
+	if( LocalTriIndex < TriRange.Num )
+	{
+		const uint TriIndex = TriRange.Start + LocalTriIndex;
+		uint3 VertIndexes = DecodeTriangleIndices(Cluster, TriIndex);
+		if( bReverseWindingOrder )
+			VertIndexes.yz = VertIndexes.zy;
+
+		const uint PixelValue = ((VisibleIndex + 1) << 7) | TriIndex;
+		Out = CommonRasterizerVS(NaniteView, PrimitiveData, InstanceData, VisibleCluster, Cluster, VertIndexes[VertexID], PixelValue, bReverseWindingOrder);
+#if BARYCENTRIC_MODE_EXPORT
+		const uint VIndex = bReverseWindingOrder ? 2 : 1;
+		Out.BarycentricsUV = float2(VertexID == 0, VertexID == VIndex);
+#endif
+	}
+
+	return Out;
+}
+
+#endif // NANITE_PRIM_SHADER
+
+bool QuadActiveAnyTrue(bool Expr)
+{
+	// https://microsoft.github.io/DirectX-Specs/d3d/HLSL_SM_6_7_QuadAny_QuadAll.html
+	// NOTE: From that blog post, it seems like this approach is somewhat blessed, but the docs for
+	// QuadReadAcrossX state that the result is undefined when reading an inactive lane.
+	// So it seems, according to the docs, this could potentially give false positives, but never false negatives.
+	
+	// Helper lanes are defined to be active, so this should only ever be an issue if the lanes of
+	// a quad are made partially inactive by an earler branch. For platforms where the undefined value
+	// isn't just zero, this could result in false positives, which should still be safe
+	// in the context of how this is currently used.
+
+	const uint UIntExpr = (uint)Expr;
+	uint Result = UIntExpr;
+	Result |= QuadReadAcrossX(UIntExpr);
+	Result |= QuadReadAcrossY(UIntExpr);
+	Result |= QuadReadAcrossDiagonal(UIntExpr);
+	return Result != 0u;
+}
+
+void HWRasterizePS(VSOut In
+#if NANITE_MESH_SHADER	
+	, PrimitiveAttributes Primitive
+#endif
+#if MATERIAL_TWOSIDED
+	, bool bFrontFace : SV_IsFrontFace
+#endif
+)
+{
+#if NANITE_HW_RASTER_INTERPOLATE_DEPTH
+	// Interpolating SV_Position attributes manually can be significantly faster than having the hardware set up the registers.
+	// Unfortunately, it has also shown to have precision problems on some hardware for extremely long and narrow trinagles.
+	
+	// The compromise is to always use SV_Position for .xy, so it is guaranteed to always hit the right pixels,
+	// but interpolate depth for shadow rendering, which is usually the more HW raster heavy pass.
+	// For visibility buffer rendering the depth imprecision alone has shown to cause issues for extremely narrow triangles (UE-177564),
+	// so there SV_Position is also used for depth.
+
+	// TODO: Have the builder detect and fix the problematic cases, so we can always safely interpolate?
+
+	float4 SvPosition = float4(In.Position.xy, In.ClipZW.x / In.ClipZW.y, In.ClipZW.y);
+#else
+	float4 SvPosition = In.Position;
+#endif
+
+	uint2 PixelPos = (uint2)SvPosition.xy;
+	uint PixelValue = In.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.x;
+
+#if VERTEX_TO_TRIANGLE_MASKS
+#if NANITE_VERT_REUSE_BATCH
+	uint2 Mask_TriRangeStart = GetAttributeAtVertex0( In.ToTriangleMask_TriRangeStart );
+	uint Mask0 = Mask_TriRangeStart.x;
+	uint Mask1 = GetAttributeAtVertex1( In.ToTriangleMask_TriRangeStart ).x;
+	uint Mask2 = GetAttributeAtVertex2( In.ToTriangleMask_TriRangeStart ).x;
+	uint Mask = Mask0 & Mask1 & Mask2;
+	uint TriangleIndex = Mask_TriRangeStart.y + firstbitlow(Mask);
+	PixelValue += TriangleIndex;
+#else
+	uint4 Masks0 = GetAttributeAtVertex0( In.ToTriangleMasks );
+	uint4 Masks1 = GetAttributeAtVertex1( In.ToTriangleMasks );
+	uint4 Masks2 = GetAttributeAtVertex2( In.ToTriangleMasks );
+
+	uint4 Masks = Masks0 & Masks1 & Masks2;
+	uint TriangleIndex =	Masks.x ? firstbitlow( Masks.x ) :
+							Masks.y ? firstbitlow( Masks.y ) + 32 :
+							Masks.z ? firstbitlow( Masks.z ) + 64 :
+							firstbitlow( Masks.w ) + 96;
+
+	PixelValue += TriangleIndex;
+#endif
+#endif
+
+#if NANITE_MESH_SHADER
+	// In.PixelValue will be 0 here because mesh shaders will pass down the following indices through per-primitive attributes.
+	const uint ClusterIndex  = Primitive.PackedData.x;
+	const uint TriangleIndex = Primitive.PackedData.y;
+	PixelValue = ((ClusterIndex + 1) << 7) | TriangleIndex;
+#endif
+
+#if VIRTUAL_TEXTURE_TARGET
+	PixelPos += In.ViewRect.xy;
+	if (all(PixelPos < In.ViewRect.zw))
+#else
+	// In multi-view mode every view has its own scissor, so we have to scissor manually.
+	if( all( (PixelPos >= In.ViewRect.xy) & (PixelPos < In.ViewRect.zw) ) )
+#endif
+	{
+		const uint ViewId		= BitFieldExtractU32(In.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.y, 16, 0);
+		const bool bSwapVW		= BitFieldExtractU32(In.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.y, 1, 16);
+
+		float MaterialMask = 1.0f;
+
+		FVisBufferPixel Pixel = CreateVisBufferPixel( PixelPos, PixelValue, SvPosition.z );
+	#if VISUALIZE
+		Pixel.VisualizeValues = GetVisualizeValues();
+	#endif
+		
+
+	#if VIRTUAL_TEXTURE_TARGET
+		const uint MipLevel		= BitFieldExtractU32(In.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.y, 5, 18);
+		const uint ArrayIndex	= In.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.y >> 23;
+		const uint LevelOffset	= In.PixelValue_ViewId_SwapVW_Mip_ArrayIndex_LevelOffset.z;
+
+		if( !VirtualToPhysicalTexel_PageTableLevelOffset( InitVirtualMLevelOffset(LevelOffset), MipLevel, Pixel.Position, Pixel.PhysicalPosition.xy ) )
+		{
+			// mapped to non-commited space.
+			return;
+		}
+
+		Pixel.PhysicalPosition.z = ArrayIndex;
+	#endif
+
+		Pixel.WriteOverdraw();
+
+	#if ENABLE_EARLY_Z_TEST
+		BRANCH
+		if( !QuadActiveAnyTrue( Pixel.EarlyDepthTest() ) )
+		{
+			return;
+		}
+	#endif
+
+	// Note: NANITE_PIXEL_PROGRAMMABLE is currently too conservative and PDO / Masking needs to be checked explicitly to remove unused code
+	// See ShouldCompileProgrammablePermutation in NaniteCullRaster.cpp
+	#if NANITE_PIXEL_PROGRAMMABLE && (WANT_PIXEL_DEPTH_OFFSET || MATERIALBLENDING_MASKED)
+		const FNaniteView NaniteView = GetNaniteView(ViewId);
+
+		ResolvedView = ResolveView(NaniteView);
+
+		const uint DepthInt = asuint(SvPosition.z);
+		const UlongType PackedPixel = PackUlongType(uint2(PixelValue, DepthInt));
+
+		FVertexFactoryInterpolantsVSToPS Interpolants = (FVertexFactoryInterpolantsVSToPS)0;
+
+		// Material parameter inputs
+		FBarycentrics Barycentrics = (FBarycentrics)0;
+		
+		bool bCalcVertIndexes = true;
+		uint3 VertIndexes = 0;
+	#if BARYCENTRIC_MODE_INTRINSICS
+		const uint VertexID0 = GetAttributeAtVertex0(In.VertexID);
+		const uint VertexID1 = GetAttributeAtVertex1(In.VertexID);
+		const uint VertexID2 = GetAttributeAtVertex2(In.VertexID);
+		VertIndexes = uint3(VertexID0, VertexID1, VertexID2);
+
+		// Recover barycentrics from hardware ViVj:
+		// v = v0 + I (v1 - v0) + J (v2 - v0) = (1 - I - J) v0 + I v1 + J v2
+		const float2 ViVj = GetViVjPerspectiveCenter();
+		const float3 UVW = float3(1.0f - ViVj.x - ViVj.y, ViVj);
+
+		// The vertex order can be rotated during the rasterization process,
+		// so the original order needs to be recovered to make sense of the barycentrics.
+		
+		// Fortunately, for compression purposes, triangle indices already have the form (base, base+a, base+b), where a,b>0.
+		// This turns out to be convenient as it allows us to recover the original vertex order by simply rotating
+		// the lowest vertex index into the first position. This saves an export compared to the usual provoking vertex trick
+		// that compares with an additional nointerpolation export.
+		const uint MinVertexID = min3(VertexID0, VertexID1, VertexID2);	
+
+		Barycentrics.Value =	(MinVertexID == VertexID1) ? UVW.yzx :
+								(MinVertexID == VertexID2) ? UVW.zxy :
+								UVW;
+
+		// As we already have the indices on hand, so we might as well use them instead of decoding them again from memory
+		VertIndexes =	(MinVertexID == VertexID1) ? VertIndexes.yzx :
+						(MinVertexID == VertexID2) ? VertIndexes.zxy :
+						VertIndexes;
+
+		if (bSwapVW)
+		{
+			Barycentrics.Value.yz = Barycentrics.Value.zy;
+			VertIndexes.yz = VertIndexes.zy;
+		}
+
+		bCalcVertIndexes = false;
+	#elif BARYCENTRIC_MODE_SV_BARYCENTRICS && PIXELSHADER
+		Barycentrics.Value = In.Barycentrics;
+		if (bSwapVW)
+		{
+			Barycentrics.Value.yz = Barycentrics.Value.zy;
+		}
+	#elif BARYCENTRIC_MODE_EXPORT
+		Barycentrics.Value = float3(In.BarycentricsUV, 1.0f - In.BarycentricsUV.x - In.BarycentricsUV.y);
+	#endif
+		
+		FMaterialPixelParameters MaterialParameters = FetchNaniteMaterialPixelParameters(NaniteView, PackedPixel, VIRTUAL_TEXTURE_TARGET, Barycentrics, false, VertIndexes, bCalcVertIndexes, Interpolants, SvPosition );
+	#if MATERIAL_TWOSIDED
+		MaterialParameters.TwoSidedSign = bFrontFace ? -1.0f : 1.0f;
+	#endif
+
+	#if NUM_TEX_COORD_INTERPOLATORS > 0
+		MaterialParameters.TexCoords[0]		= In.TexCoords.xy;
+		MaterialParameters.TexCoords_DDX[0]	= ddx( In.TexCoords.xy );
+		MaterialParameters.TexCoords_DDY[0]	= ddy( In.TexCoords.xy );
+	#endif
+
+	#if NUM_TEX_COORD_INTERPOLATORS > 1
+		MaterialParameters.TexCoords[1]		= In.TexCoords.zw;
+		MaterialParameters.TexCoords_DDX[1]	= ddx( In.TexCoords.zw );
+		MaterialParameters.TexCoords_DDY[1]	= ddy( In.TexCoords.zw );
+	#endif
+
+		FPixelMaterialInputs PixelMaterialInputs;
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+		CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, SvPosition, MaterialParameters.ScreenPosition, true, MaterialParameters.WorldPosition_CamRelative, MaterialParameters.WorldPosition_NoOffsets_CamRelative);
+#else
+		CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, true /*bIsFrontFace*/);
+#endif
+
+		// NOTE: Disable PDO in shadow passes (it does undesirable things and has always been disabled in these passes in Unreal)
+		#if WANT_PIXEL_DEPTH_OFFSET && SHADOW_DEPTH_SHADER == 0
+		ApplyPixelDepthOffsetToMaterialParameters(MaterialParameters, PixelMaterialInputs, Pixel.Depth);
+		#endif
+
+		#if MATERIALBLENDING_MASKED
+		MaterialMask = GetMaterialMask(PixelMaterialInputs);
+		#endif
+	#endif // NANITE_PIXEL_PROGRAMMABLE && (WANT_PIXEL_DEPTH_OFFSET || MATERIALBLENDING_MASKED)
+
+		BRANCH
+		if (MaterialMask >= 0)
+		{
+			Pixel.Write();
+		}
+	}
+}
+

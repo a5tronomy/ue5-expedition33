@@ -1,0 +1,7 @@
+arb-dir: lib/src/l10n
+template-arb-file: epic_common_en.arb
+synthetic-package: false
+header-file: generated_header.txt
+output-class: EpicCommonLocalizations
+output-dir: lib/src/l10n/generated
+output-localization-file: epic_common_localizations.dart

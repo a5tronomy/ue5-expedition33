@@ -1,0 +1,102 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	VulkanCommon.ush: Common Vulkan shader code
+=============================================================================*/
+
+#pragma once
+
+// Update this GUID to invalidate shader recompilation for only Vulkan shaders
+#pragma message("UESHADERMETADATA_VERSION BB707B6A-C217-4B23-9A22-086E9EC77FCF")
+
+#define COMPILER_SUPPORTS_ULONG_TYPES 1
+#define COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS (1 && COMPILER_SUPPORTS_ULONG_TYPES)
+
+#if COMPILER_SUPPORTS_ULONG_TYPES
+
+#define UlongType uint64_t
+
+UlongType PackUlongType(uint2 Value)
+{
+	return ((UlongType)Value.y << 32) | Value.x;
+}
+
+uint2 UnpackUlongType(UlongType Value)
+{
+	return uint2(uint(Value), uint(Value >> 32));
+}
+
+#endif
+
+#if COMPILER_SUPPORTS_UINT64_IMAGE_ATOMICS
+void ImageInterlockedMaxUInt64(RWTexture2D<UlongType> Dest, uint2 Coord, UlongType Value)
+{
+	InterlockedMax(Dest[Coord], Value);
+}
+#endif
+
+#if PLATFORM_SUPPORTS_BINDLESS
+	// While we use descriptor indexing, declare unbounded resource arrays
+	COMPILER_DEFINE VULKAN_HEAP_NAME(Prefix, Type) Prefix##Type
+	COMPILER_DEFINE VULKAN_SAMPLER_HEAP(Type) VULKAN_HEAP_NAME(VULKAN_BINDLESS_SAMPLER_ARRAY_PREFIX,Type)
+	COMPILER_DEFINE VULKAN_SRV_HEAP(Type) VULKAN_HEAP_NAME(VULKAN_BINDLESS_SRV_ARRAY_PREFIX,Type)
+	COMPILER_DEFINE VULKAN_UAV_HEAP(Type) VULKAN_HEAP_NAME(VULKAN_BINDLESS_UAV_ARRAY_PREFIX,Type)
+
+	#define UB_RESOURCE_MEMBER_SRV(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		SafeType##UBName##_##Name VULKAN_SRV_HEAP(SafeType##UBName##_##Name)[]; \
+		Type GetBindlessResource##UBName##_##Name() { \
+			return VULKAN_SRV_HEAP(SafeType##UBName##_##Name)[UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessSRV_, Name)]; \
+		} \
+		static const Type UBName##_##Name = GetBindlessResource##UBName##_##Name();
+
+	#define UB_RESOURCE_MEMBER_UAV(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		SafeType##UBName##_##Name VULKAN_UAV_HEAP(SafeType##UBName##_##Name)[]; \
+		Type GetBindlessResource##UBName##_##Name() { \
+			return VULKAN_UAV_HEAP(SafeType##UBName##_##Name)[UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessUAV_, Name)]; \
+		} \
+		static const Type UBName##_##Name = GetBindlessResource##UBName##_##Name();
+
+	#define UB_RESOURCE_MEMBER_SAMPLER(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		SafeType##UBName##_##Name VULKAN_SAMPLER_HEAP(SafeType##UBName##_##Name)[]; \
+		Type GetBindlessSampler##UBName##_##Name() { \
+			return VULKAN_SAMPLER_HEAP(SafeType##UBName##_##Name)[UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessSampler_, Name)]; \
+		} \
+		static const Type UBName##_##Name = GetBindlessSampler##UBName##_##Name();
+#endif
+
+#if VULKAN_SUPPORTS_SUBGROUP_SIZE_CONTROL
+	#define COMPILER_SUPPORTS_WAVE_SIZE 1
+
+	// NOTE: Wave size in Vulkan is supported at shader stage in the pipeline creation.
+	// Create something unique we can read back from the shader, but that goes away on the rewrite
+	COMPILER_DEFINE VULKAN_WAVESIZE(N)
+	#define WAVESIZE(N) VULKAN_WAVESIZE(N)
+#endif
+
+#if PLATFORM_SUPPORTS_BINDLESS && (RAYCALLABLESHADER || RAYHITGROUPSHADER || RAYGENSHADER || RAYMISSSHADER)
+	#define OVERRIDE_RAY_TRACING_HIT_GROUP_SYSTEM_RESOURCES 1
+	#include "/Engine/Shared/RayTracingBuiltInResources.h"
+
+	// Combine the common FHitGroupSystemRootConstants with bindless parameters
+	// :todo-jn: must match with VulkanRayTracing.h decl until we create a common header like RayTracingBuiltInResources.h
+	struct FVulkanHitGroupSystemParameters
+	{
+		FHitGroupSystemRootConstants RootConstants;
+
+		uint BindlessHitGroupSystemIndexBuffer;
+		uint BindlessHitGroupSystemVertexBuffer;
+
+		uint BindlessUniformBuffers[VULKAN_MAX_BINDLESS_UNIFORM_BUFFERS_PER_STAGE];
+	};
+
+	[[vk::shader_record_ext]] ConstantBuffer<FVulkanHitGroupSystemParameters> VulkanHitGroupSystemParameters;
+
+	static const FHitGroupSystemRootConstants HitGroupSystemRootConstants = VulkanHitGroupSystemParameters.RootConstants;
+
+	ByteAddressBuffer VULKAN_SRV_HEAP(HitGroupSystemBuffers)[];
+	static const ByteAddressBuffer HitGroupSystemIndexBuffer = VULKAN_SRV_HEAP(HitGroupSystemBuffers)[VulkanHitGroupSystemParameters.BindlessHitGroupSystemIndexBuffer];
+	static const ByteAddressBuffer HitGroupSystemVertexBuffer = VULKAN_SRV_HEAP(HitGroupSystemBuffers)[VulkanHitGroupSystemParameters.BindlessHitGroupSystemVertexBuffer];
+#endif

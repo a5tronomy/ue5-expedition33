@@ -1,0 +1,6 @@
+{
+    "search.exclude": {
+        "dist": true,
+        "functional_tests/framework/dist": true
+    }
+}

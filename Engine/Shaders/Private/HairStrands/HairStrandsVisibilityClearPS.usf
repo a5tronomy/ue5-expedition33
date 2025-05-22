@@ -1,0 +1,26 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+
+
+uint uClearValue; 
+float fClearValue;
+
+void ClearPS(
+#if PERMUTATION_OUTPUT_FORMAT == 0
+	out uint OutColor : SV_Target0
+#elif PERMUTATION_OUTPUT_FORMAT == 1
+	out uint2 OutColor : SV_Target0
+#elif PERMUTATION_OUTPUT_FORMAT == 2
+	out float OutColor : SV_Target0
+#endif
+)
+{
+#if PERMUTATION_OUTPUT_FORMAT == 0
+	OutColor = uClearValue;
+#elif PERMUTATION_OUTPUT_FORMAT == 1
+	OutColor = uClearValue.xx;
+#elif PERMUTATION_OUTPUT_FORMAT == 2
+	OutColor = fClearValue;
+#endif
+}
