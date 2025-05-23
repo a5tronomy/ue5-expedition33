@@ -960,6 +960,12 @@ struct FScrollBarStyle : public FSlateWidgetStyle
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category=Appearance)
 	float Thickness;
 	FScrollBarStyle& SetThickness(float InThickness) { Thickness = InThickness; return *this; }
+	
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category=Appearance )
+	bool bIsOnLeftSide;
+	FScrollBarStyle& SetIsOnLeftSide(bool InIsOnLeftSide) { bIsOnLeftSide = InIsOnLeftSide; return *this; }
 
 	/**
 	 * Unlinks all colors in this style.

@@ -614,6 +614,10 @@ public:
 #endif
 	}
 
+	/** Expedition 33 Custom Engine */
+	/** Insert of unreflected data */
+	uint8 UnknownData_MaterialInstance[0x8] = {};
+	
 	/** Scalar parameters. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category=MaterialInstance, meta = (EditFixedOrder))
 	TArray<struct FScalarParameterValue> ScalarParameterValues;

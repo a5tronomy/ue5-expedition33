@@ -329,6 +329,15 @@ public:
 	UPROPERTY(EditAnywhere, AdvancedDisplay, BlueprintReadWrite, Category=TextureStreaming, meta=(ClampMin = 0, ToolTip="Allows adjusting the desired resolution of streaming textures that uses UV 0.  1.0 is the default, whereas a higher value increases the streamed-in resolution."))
 	float StreamingDistanceMultiplier;
 
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, AdvancedDisplay, BlueprintReadOnly, Category=Nanite)
+	float NanitePixelProgrammableDistance;
+
+	/** Expedition 33 Custom Engine */
+	/** Insert of unreflected data */
+	uint8 UnknownData_StaticMeshComponent[0x2] = {};
+	
 #if WITH_EDITORONLY_DATA
 	UPROPERTY()
 	TArray<FGuid> IrrelevantLights_DEPRECATED;

@@ -203,6 +203,11 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = ListView)
 	bool bReturnFocusToSelection = false;
 
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, Category = ListView)
+	ESlateVisibility ScrollbarDisabledVisibility;
+
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UObject>> ListItems;
 

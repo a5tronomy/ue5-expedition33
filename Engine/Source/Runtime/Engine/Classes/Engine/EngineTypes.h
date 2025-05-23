@@ -3052,6 +3052,22 @@ public:
 	}
 };
 
+/** Expedition 33 Custom Engine */
+/** Custom structure for Expedition 33*/
+USTRUCT(BlueprintType)
+struct FDisplacementFadeRange
+{
+	GENERATED_USTRUCT_BODY()
+
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Displacement)
+	float StartSizePixels;
+
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Displacement)
+	float EndSizePixels;
+};
+
 /** The network role of an actor on a local/remote network context */
 UENUM(BlueprintType)
 enum ENetRole : int
@@ -3185,6 +3201,10 @@ enum EWalkableSlopeBehavior : int
 	 * Note: WalkableSlopeAngle will be ignored.
 	 */
 	WalkableSlope_Unwalkable	UMETA(DisplayName="Unwalkable"),
+
+	/** Expedition 33 Custom Engine */
+	/** Custom enum value for Expedition 33, changing this will not affect anything */
+	WalkableSlope_Walkable	UMETA(DisplayName="Walkable"),
 	
 	WalkableSlope_Max		UMETA(Hidden),
 };

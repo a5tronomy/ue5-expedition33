@@ -108,6 +108,11 @@ public:
 	/** A bitmask of trigger events that, when reached, will consume any FKeys mapped to this input action. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Input Consumption", meta=(EditCondition = "bConsumesActionAndAxisMappings", Bitmask, BitmaskEnum="/Script/EnhancedInput.ETriggerEvent"))
 	int32 TriggerEventsThatConsumeLegacyKeys;
+
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Action)
+	bool bNeverIgnorePressedKeysUntilRelease;
 	
 	// The type that this action returns from a GetActionValue query or action event
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = Action, AssetRegistrySearchable)

@@ -57,6 +57,16 @@ struct FMaterialInstanceBasePropertyOverrides
 	UPROPERTY(EditAnywhere, Category = Material)
 	uint8 bOverride_DisplacementScaling : 1;
 
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, Category = Material)
+	uint8 bOverride_bEnableDisplacementFade: 1;
+
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, Category = Material)
+	uint8 bOverride_DisplacementFadeRange: 1;
+
 	/** Enables override of the max world position offset property. */
 	UPROPERTY(EditAnywhere, Category = Material)
 	uint8 bOverride_MaxWorldPositionOffsetDisplacement : 1;
@@ -66,7 +76,7 @@ struct FMaterialInstanceBasePropertyOverrides
 	uint8 TwoSided : 1;
 
 	/** Indicates that the material should be rendered as. */
-	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_bThinSurface"))
+	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_bIsThinSurface"))
 	uint8 bIsThinSurface : 1;
 
 	/** Whether the material should support a dithered LOD transition when used with the foliage system. */
@@ -91,6 +101,11 @@ struct FMaterialInstanceBasePropertyOverrides
 	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_bEnableTessellation"))
 	uint8 bEnableTessellation : 1;
 
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_bEnableDisplacementFade"))
+	uint8 bEnableDisplacementFade: 1;
+
 	/** The blend mode */
 	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_BlendMode"))
 	TEnumAsByte<EBlendMode> BlendMode;
@@ -105,6 +120,11 @@ struct FMaterialInstanceBasePropertyOverrides
 
 	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_DisplacementScaling"))
 	FDisplacementScaling DisplacementScaling;
+
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_DisplacementFadeRange"))
+	FDisplacementFadeRange DisplacementFadeRange;
 
 	/** The maximum World Position Offset distance. Zero means no maximum. */
 	UPROPERTY(EditAnywhere, Category = Material, meta = (editcondition = "bOverride_MaxWorldPositionOffsetDisplacement", ClampMin=0.0f, NoSpinbox = true))

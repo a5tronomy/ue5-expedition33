@@ -1034,6 +1034,13 @@ void UEnhancedInputUserSettings::UnMapPlayerKey(const FMapPlayerKeyArgs& InArgs,
 	}
 }
 
+/** Expedition 33 Custom Engine */
+/** Custom function for Expedition 33 */
+void UEnhancedInputUserSettings::SetSettingsSaveSlotName(const FString& InSettingsSaveSlotName)
+{
+	this->SaveSlotName = InSettingsSaveSlotName;
+}
+
 void UEnhancedInputUserSettings::ResetAllPlayerKeysInRow(const FMapPlayerKeyArgs& InArgs, FGameplayTagContainer& FailureReason)
 {
 	if (!InArgs.MappingName.IsValid())

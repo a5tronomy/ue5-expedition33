@@ -469,6 +469,11 @@ class UMaterial : public UMaterialInterface
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Nanite, meta = (DisplayName = "Displacement", EditCondition="bEnableTessellation"))
 	FDisplacementScaling DisplacementScaling;
 
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Nanite, meta = (DisplayName = "Displacement", EditCondition="bEnableDisplacementFade"))
+	FDisplacementFadeRange DisplacementFadeRange;
+
 private:
 	/** Determines how inputs are combined to create the material's final color. */
 	UPROPERTY(EditAnywhere, Category=Material, AssetRegistrySearchable)
@@ -549,6 +554,11 @@ public:
 	/** Whether tessellation is enabled on the material. NOTE: Required for displacement to work. */
 	UPROPERTY(EditAnywhere, Category=Nanite)
 	uint8 bEnableTessellation : 1;
+
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(EditAnywhere, Category=Nanite)
+	uint8 bEnableDisplacementFade: 1;
 
 	/**
 	 * Specifies the separate pass in which to render translucency.

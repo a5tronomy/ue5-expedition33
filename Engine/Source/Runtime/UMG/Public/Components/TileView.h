@@ -58,7 +58,7 @@ protected:
 		Args.bWrapDirectionalNavigation = bWrapHorizontalNavigation;
 		Args.Orientation = Orientation;
 		Args.ScrollBarStyle = &ScrollBarStyle;
-		Args.ScrollbarDisabledVisibility = UWidget::ConvertSerializedVisibilityToRuntime(ScrollbarDisabledVisibility);
+		// Args.ScrollbarDisabledVisibility = UWidget::ConvertSerializedVisibilityToRuntime(ScrollbarDisabledVisibility);
 
 		if (IsAligned() && !bEntrySizeIncludesEntrySpacing)
 		{
@@ -102,9 +102,11 @@ protected:
 	UPROPERTY(EditAnywhere, Category = Navigation)
 	bool bWrapHorizontalNavigation = false;
 
+	/** Expedition 33 Custom Engine */
+	/** Property removal */
 	/** Set the visibility of the Scrollbar when it's not needed */
-	UPROPERTY(EditAnywhere, Category = ListView, meta=(ValidEnumValues="Collapsed, Hidden, Visible"))
-	ESlateVisibility ScrollbarDisabledVisibility = ESlateVisibility::Collapsed;
+	// UPROPERTY(EditAnywhere, Category = ListView, meta=(ValidEnumValues="Collapsed, Hidden, Visible"))
+	// ESlateVisibility ScrollbarDisabledVisibility = ESlateVisibility::Collapsed;
 
 	TSharedPtr<STileView<UObject*>> MyTileView;
 

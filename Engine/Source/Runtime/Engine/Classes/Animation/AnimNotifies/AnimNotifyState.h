@@ -20,6 +20,11 @@ class UAnimNotifyState : public UObject
 {
 	GENERATED_UCLASS_BODY()
 
+	
+	/** Expedition 33 Custom Engine */
+	/** Insert of unreflected data */
+	uint8 UnknownData_AnimNotifyState[0x8] = {};
+
 	/** 
 	 * Implementable event to get a custom name for the notify
 	 */

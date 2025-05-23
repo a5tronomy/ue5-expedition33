@@ -809,6 +809,10 @@ public:
 	UPROPERTY(transient, replicated)
 	float CinematicTimeDilation;
 
+	/** Expedition 33 Custom Engine */
+	/** Insert of unreflected data */
+	uint8 UnknownData_WorldSettings01[0x10] = {};
+
 	// Additional TimeDilation used to control demo playback speed
 	UPROPERTY(transient)
 	float DemoPlayTimeDilation;
@@ -829,6 +833,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = Tick, AdvancedDisplay, meta = (UIMin = "0", ClampMin = "0"))
 	float MaxUndilatedFrameTime;
 
+	/** Expedition 33 Custom Engine */
+	/** Insert of unreflected data */
+	uint8 UnknownData_WorldSettings02[0x4] = {};
+	
 	UPROPERTY(config, EditAnywhere, Category = Broadphase)
 	FBroadphaseSettings BroadphaseSettings;
 

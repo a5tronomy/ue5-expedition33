@@ -113,6 +113,7 @@ protected:
 	/** This player's version of the Action Mappings */
 	const TArray<FEnhancedActionKeyMapping>& GetEnhancedActionMappings() const { return EnhancedActionMappings; }
 
+public:
 	/** Array of data that represents what keys should be consumed if an enhanced input action is in a specific triggered state */
 	UPROPERTY()
 	TMap<TObjectPtr<const UInputAction>, FKeyConsumptionOptions> KeyConsumptionData;
@@ -162,6 +163,10 @@ private:
 
 	/** Actions that have been triggered this tick and have a delegate that may be fired */
 	TSet<TObjectPtr<const UInputAction>> TriggeredActionsThisTick;
+
+	/** Expedition 33 Custom Engine */
+	/** Insert of unreflected data */
+	uint8 UnknownData_EnhancedPlayerInput[0x50] = {};
 
 	/**
 	 * A map of Keys to the amount they were depressed this frame. This is reset with each call to ProcessInputStack

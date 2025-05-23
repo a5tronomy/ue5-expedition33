@@ -62,6 +62,11 @@ protected:
 	// Map of inputs that should be injected every frame. These inputs will be injected when ForcedInput is ticked. 
 	UPROPERTY(Transient) 
 	TMap<TObjectPtr<const UInputAction>, FInjectedInput> ContinuouslyInjectedInputs;
+
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(Transient)
+	FString SettingsSaveSlotName;
 	
 };
 

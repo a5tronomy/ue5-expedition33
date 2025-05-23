@@ -570,6 +570,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Enhanced Input|User Settings", meta = (AutoCreateRefTerm = "FailureReason"))
 	virtual void UnMapPlayerKey(const FMapPlayerKeyArgs& InArgs, FGameplayTagContainer& FailureReason);
 
+	/** Expedition 33 Custom Engine */
+	/** Custom function for Expedition 33 */
+	UFUNCTION(BlueprintCallable, Category="Enhanced Input|User Settings", meta = (AutoCreateRefTerm = "FailureReason"))
+	virtual void SetSettingsSaveSlotName(const FString& SettingsSaveSlotName);
+
 	/**
 	* Resets each player mapped key to it's default value from the Input Mapping Context that it was registered from.
 	* If a key did not come from an IMC (i.e. it was added additionally by the player) then it will be reset to EKeys::Invalid.
@@ -732,4 +737,9 @@ protected:
 	 */
 	UPROPERTY(Transient)
 	TSet<TObjectPtr<const UInputMappingContext>> RegisteredMappingContexts;
+
+	/** Expedition 33 Custom Engine */
+	/** Custom property for Expedition 33, changing this will not affect anything */
+	UPROPERTY(Transient)
+	FString SaveSlotName;
 };
