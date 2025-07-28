@@ -27,7 +27,6 @@ FDuplicateDataReader::FDuplicateDataReader( class FUObjectAnnotationSparse<FDupl
 {
 	this->SetIsLoading(true);
 	this->SetIsPersistent(true);
-	this->SetUseUnversionedPropertySerialization(true);
 	this->ArNoIntraPropertyDelta = true;
 	ArPortFlags |= PPF_Duplicate | InPortFlags;
 
